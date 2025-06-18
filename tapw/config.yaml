@@ -1,0 +1,61 @@
+# Twisted Material Configuration File
+
+# Twist parameters
+twist:
+  twist_index_m: 3          # Twist index m, determines the twist angle
+  num_layers: 2             # Total number of layers in the structure
+  type_structure: [2, 2]    # Structure type for each layer: 1 for graphene-like, 2 for TMD-like
+  twist_layer: [1, 1]       # Which layers are twisted relative to each other
+  spin: true               # Whether to include spin in calculations
+
+# File paths and IO configuration
+paths:
+  # Base directory containing input files
+  base_path: "/data/work/zy/software/1.tapw_code/tapw_proj/tapw/examples/MoTe2/AA/3_9.43/soc"
+  # Input structure file name
+  input_file: "openmx.dat"
+  # Output directory for results (will be created if it doesn't exist)
+  output_dir: "output"
+  # K-path input file for band structure calculation
+  kpath: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.in"
+  # K-path output file
+  kpath_out: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.out"
+
+# Computation parameters
+compute:
+  # Valley configuration
+  valleys: [1,2]    # List of valleys to calculate
+                          # Available valleys:
+                          # 1: K1 valley
+                          # 2: K2 valley
+                          # 11: K1_120 valley
+                          # 12: K1_240 valley
+                          # 5: Gamma valley
+                          # 31: M1 valley
+                          # 32: M2 valley
+                          # 33: M3 valley
+  
+  # Calculation mode
+  mode: "band"            # Calculation mode: "band" for band structure, "chern" for Chern number
+  
+  # Energy parameters
+  efermi: -0.17           # Fermi energy level
+  n_g: 3                  # Harmonic of G vectors
+  
+  # Band structure calculation parameters
+  num_processes: 61       # Number of parallel processes
+  num_bands_cal: 50      # Number of bands to calculate
+  num_chern: 40          # Number of k-points for Chern number calculation (grid size will be num_chern x num_chern)
+  
+  # Hardware acceleration
+  gpu: false             # Whether to use GPU acceleration
+  gpu_index: [0, 1]      # GPU device indices to use
+  delay_time: 0          # Delay time between GPU operations
+  
+  # Calculation flags
+  hamk_save: false       # Whether to save Hamiltonian matrices
+  TAPW: true            # Use TAPW method
+  eigsh_cal: true       # Use eigsh for eigenvalue calculation
+  C3_H: false           # Apply C3 symmetry to Hamiltonian
+  ge: false             # Use generalized eigenvalue solver
+  eig_vec_cal: true     # Calculate eigenvectors 
