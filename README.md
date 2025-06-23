@@ -32,42 +32,21 @@ pip install -e .
 ## Usage
 
 1. Prepare your configuration file (config.yaml):
-```yaml
-# Twist parameters
-twist:
-  twist_index_m: 3          # Twist index m
-  num_layers: 2             # Number of layers
-  type_structure: [2, 2]    # Structure type for each layer
-  twist_layer: [1, 1]       # Twist configuration
-  spin: true               # Include spin
-
-# File paths
-paths:
-  base_path: "path/to/your/data"
-  input_file: "openmx.dat"
-  output_dir: "output"
-  kpath: "path/to/KPATH_GMKG.in"
-  kpath_out: "path/to/KPATH_GMKG.out"
-
-# Computation parameters
-compute:
-  valleys: [1,2]           # Valleys to calculate
-  mode: "band"            # "band" or "chern"
-  efermi: -0.17           # Fermi energy
-  n_g: 3                  # Harmonic of G vectors
-  num_processes: 61       # Number of parallel processes
-  num_bands_cal: 50      # Number of bands
-  gpu: false             # GPU acceleration
+```bash
+tapw-config -o output_dir
 ```
+and then you can edit the `config.yaml` and `bands.yaml` files in the output_dir.
 
 2. Run the calculation:
 ```bash
+cd output_dir
 tapw-calc --config config.yaml
 ```
 
 3. Plot the band structure:
 ```bash
-tapw-plot --config plot_config.yaml
+cd output_dir/Q_shell_{n_g}/band_data
+tapw-plot --config ../../bands.yaml
 ```
 
 Or with command line arguments:
@@ -75,6 +54,17 @@ Or with command line arguments:
 ```bash
 tapw-plot --kpath-in KPATH.in --kpath-out KPATH.out --bands band1.dat band2.dat --labels "Band 1" "Band 2" --fermi 0.0
 ```
+4. Calculate the Chern number:
+```bash
+cd output_dir
+tapw-calc --config config.yaml --mode chern --n_g 4 --num_processes 100 --num_chern 20
+#or you can directly edit the config.yaml file
+#and then run the following command
+tapw-calc --config config.yaml
+cd output_dir/Q_shell_{n_g}
+tapw-chernpost --config config.yaml -b -1,-2 -v 1 > tapw_chern.log
+```
+
 
 ## Configuration
 

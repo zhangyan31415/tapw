@@ -38,7 +38,7 @@ output/
 *.xyz
 *.dat
 *.ene
-*.md
+# *.md
 *.md2
 *.cc
 *.ftCvna
