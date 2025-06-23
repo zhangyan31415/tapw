@@ -41,8 +41,7 @@ class OpenMXFile:
         self.calc_twist_angle()
         self.calc_num_unit_cell()
         self.parse_file()
-        print("shit")
-        print(self.species_coordinates)
+        # print(self.species_coordinates)
         self.sort_atoms_by_z()
         self.compute_permutation_matrix()
         self.count_species()
@@ -353,7 +352,7 @@ class LayeredLatticeAnalyzer:
         """
         data = []
         for item in self.input_data:
-            print(item)
+            # print(item)
             index = item['original_index']
             species = item['species']
             x, y, z = item['x'],item['y'],item['z']

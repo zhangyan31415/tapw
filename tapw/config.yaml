@@ -10,16 +10,12 @@ twist:
 
 # File paths and IO configuration
 paths:
-  # Base directory containing input files
-  base_path: "/data/work/zy/software/1.tapw_code/tapw_proj/tapw/examples/MoTe2/AA/3_9.43/soc"
-  # Input structure file name
-  input_file: "openmx.dat"
-  # Output directory for results (will be created if it doesn't exist)
-  output_dir: "output"
-  # K-path input file for band structure calculation
-  kpath: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.in"
-  # K-path output file
-  kpath_out: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.out"
+  H_file: "H.dat"   # Hamiltonian file, can be .dat or .npz
+  S_file: "S.dat"   # Overlap file, can be .dat or .npz
+  input_file: "openmx.dat"   # Input structure file name
+  output_dir: "output"   # Output directory for results (will be created if it doesn't exist)
+  kpath_in: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.in"   # K-path input file for band structure calculation
+  kpath_out: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.out"   # K-path output file
 
 # Computation parameters
 compute:
@@ -39,12 +35,12 @@ compute:
   mode: "band"            # Calculation mode: "band" for band structure, "chern" for Chern number
   
   # Energy parameters
-  efermi: -0.17           # Fermi energy level
+  efermi: -4.6           # Fermi energy level, unit: eV
   n_g: 3                  # Harmonic of G vectors
   
   # Band structure calculation parameters
   num_processes: 61       # Number of parallel processes
-  num_bands_cal: 50      # Number of bands to calculate
+  num_bands_cal: 20      # Number of bands to calculate
   num_chern: 40          # Number of k-points for Chern number calculation (grid size will be num_chern x num_chern)
   
   # Hardware acceleration

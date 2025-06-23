@@ -11,6 +11,7 @@ import time
 import psutil
 from datetime import datetime
 from functools import wraps
+Hartree = 27.21138602435532
 
 def timing_decorator_factory(process_id):
     def timing_decorator(func):
@@ -94,7 +95,9 @@ class HrSparseHandler:
                 del new_hr_sparse[rvec]["imag"]
 
         self.hr_sparse = new_hr_sparse
-        self.save_to_npz(self.npz_file_name)
+
+        npz_file_name = self.file_name.replace('.dat', '.npz')
+        self.save_to_npz(npz_file_name)
 
     def save_to_npz(self, file_path):
         storable_data = {}
@@ -118,7 +121,10 @@ class HrSparseHandler:
             elif attribute == 'col':
                 data[key_tuple]['col'] = loaded_data[key]
             elif attribute == 'val':
-                data[key_tuple]['val'] = loaded_data[key]
+                if 'deeph-pack' in file_path and 'H.npz' in file_path:
+                    data[key_tuple]['val'] = loaded_data[key] * Hartree
+                else:
+                    data[key_tuple]['val'] = loaded_data[key]
         self.hr_sparse = data
     
     @timing_decorator_factory(0)
@@ -135,7 +141,11 @@ class HrSparseHandler:
             elif attribute == 'col':
                 data[key_tuple]['col'] = loaded_data[key]
             elif attribute == 'val':
-                data[key_tuple]['val'] = loaded_data[key]
+                if 'deeph-pack' in file_path and 'H.npz' in file_path:
+                    print("loaded data from deeph-pack")
+                    data[key_tuple]['val'] = loaded_data[key] * Hartree
+                else:
+                    data[key_tuple]['val'] = loaded_data[key]
         self.hr_sparse = data
         
         hr_sparse_chunk = data 
@@ -160,8 +170,16 @@ class HrSparseHandler:
         # self.save_to_npz(self.npz_file_name)
 
     def get_hr_sparse(self):
-        if self.read_from_npz or os.path.exists(self.npz_file_name):
-            self.load_from_npz(self.npz_file_name)
+        if self.file_name.endswith('.dat'):
+            npz_file_name = self.file_name.replace('.dat', '.npz')
+        else:
+            npz_file_name = self.npz_file_name
+        if self.read_from_npz or os.path.exists(self.npz_file_name) or os.path.exists(npz_file_name):
+            # self.load_from_npz(npz_file_name)
+            if 'deeph-pack' in self.npz_file_name:
+                self.load_from_npz_new(npz_file_name)
+            else:
+                self.load_from_npz(npz_file_name)
             # self.load_from_npz_new(self.npz_file_name)
         else:
             self.read_txt_file()

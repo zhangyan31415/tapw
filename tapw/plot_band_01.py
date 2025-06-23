@@ -37,31 +37,57 @@ class PlotConfig:
     legend_show: bool = False  # 添加是否显示图例的配置
     legend_fontsize: int = 9   # 添加图例字体大小的配置
     global_plot_type: Optional[str] = None  # 全局设置，会覆盖单个band的设置
+    marker_size: float = 20
+    marker: str = 'o'
     fermi_energy: Optional[float] = None  # 添加费米能级
     fermi_line: bool = True  # 是否画费米能级的水平线
     
 DEFAULT_COLORS = ['#DE6E66', 'dodgerblue', 'g', 'purple', 'orange', 'brown']
 
 def format_kpoint_label(label: str) -> str:
-    """格式化k点标签，处理特殊情况如G_M -> Γ_M"""
+    """格式化k点标签，处理特殊情况如G_M -> Γ_M或'Gamma Valley'"""
     # 处理常见的k点标签
     label_map = {
-        'G': r'{\Gamma}',
         'Gamma': r'{\Gamma}',
+        'G': r'{\Gamma}',
         'K': r'{\mathrm{K}}',
         'M': r'{\mathrm{M}}',
         'X': r'{\mathrm{X}}',
         'Y': r'{\mathrm{Y}}'
     }
+    # Sort keys by length, descending, to match 'Gamma' before 'G'
+    sorted_keys = sorted(label_map.keys(), key=len, reverse=True)
     
-    # 分割标签，处理下标情况（如G_M）
+    # 1. 处理带下划线的标签（例如 G_M -> Γ_M）
     if '_' in label:
-        main_label, subscript = label.split('_')
+        main_label, subscript = label.split('_', 1)
         main_label = label_map.get(main_label, r'{\mathrm{' + main_label + r'}}')
         return fr'${main_label}_\mathrm{{{subscript}}}$'
-    
-    # 处理单个标签
-    return fr'${label_map.get(label, r"{\mathrm{" + label + r"}}")}$'
+
+    # 2. 处理带空格的复杂标签 (例如 'Gamma Valley', "K' point")
+    parts = label.split(' ')
+    formatted_parts = []
+    for part in parts:
+        if not part: continue # Skip empty parts that might result from multiple spaces
+
+        # 检查部分是否以已知的k点符号开头
+        found_match = False
+        for key in sorted_keys:
+            if part.startswith(key):
+                rest_of_part = part[len(key):]
+                # '代表prime，在LaTeX中用'表示
+                if rest_of_part == "'":
+                    formatted_parts.append(f"{label_map[key]}'")
+                else: # 其他情况，用\mathrm包裹
+                    formatted_parts.append(f"{label_map[key]}" + (r"\mathrm{" + rest_of_part + "}" if rest_of_part else ""))
+                found_match = True
+                break
+        
+        if not found_match:
+            # 如果没有匹配，则将整个部分视为普通文本
+            formatted_parts.append(r'\mathrm{' + part + '}')
+    print(f'${" ".join(formatted_parts)}$'.replace(' ', r'\ '))
+    return f'${" ".join(formatted_parts)}$'.replace(' ', r'\ ')
 
 def parse_kpath_labels(lines: List[str]) -> Tuple[List[str], List[int]]:
     """
@@ -152,12 +178,59 @@ def plot_bands(config: PlotConfig):
     fig, ax = plt.subplots(figsize=(3, 5))
     
     # 画每个文件的能带
+    band_all = []
+    for band in config.bands:
+        data = read_band_data(band.file)
+        if config.fermi_energy is not None:
+            data = data - config.fermi_energy
+        band_all.append(data)
+    band_all = np.concatenate(band_all, axis=0)
+    print(band_all.shape)
+    ymin = None
+    ymax = None
+    efermi_shift = 0
+    if np.abs(np.max(band_all)) < np.abs(np.min(band_all)):
+        if np.abs(np.max(band_all)) < 0.3:
+            efermi_shift = np.max(band_all)
+            band_all = band_all - np.max(band_all)
+            ymin = np.min(band_all[:,-6])
+            ymax = - ymin/6
+    else:
+        if np.abs(np.min(band_all)) < 0.3:
+            efermi_shift = np.min(band_all)
+            band_all = band_all - np.min(band_all)
+            ymax = np.max(band_all[:,6])
+            ymin = -ymax/6
+    # if np.abs(np.max(band_all)) < 0.3:
+    #     efermi_shift = np.max(band_all)
+    #     band_all = band_all - np.max(band_all)
+    #     ymin = np.min(band_all[:,-6])
+    #     ymax = - ymin/6
+    # if np.abs(np.min(band_all)) < 0.3:
+    #     efermi_shift = np.min(band_all)
+    #     band_all = band_all - np.min(band_all)
+    #     ymax = np.max(band_all[:,6])
+    #     ymin = -ymax/6
+    print(efermi_shift, ymin, ymax,np.abs(np.max(band_all)),np.abs(np.min(band_all)))
+        
+        
+        
     for i, band in enumerate(config.bands):
         data = read_band_data(band.file)  # data shape: (n_kpoints, n_bands)
         
         # 如果设置了费米能级，减去费米能级
         if config.fermi_energy is not None:
-            data = data - config.fermi_energy
+            data = data - config.fermi_energy - efermi_shift
+        # ymin = None
+        # ymax = None
+        # if np.abs(np.max(data)) < 0.2:
+        #     data = data - np.max(data)
+        #     ymin = np.min(data[:,-6])
+        #     ymax = - ymin/6
+        # if np.abs(np.min(data)) < 0.2:
+        #     data = data - np.min(data)
+        #     ymax = np.max(data[:,6])
+        #     ymin = -ymax/6
             
         color = band.color or DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
         
@@ -172,7 +245,7 @@ def plot_bands(config: PlotConfig):
             # 第一条带带标签
             ax.scatter(x_coords, data[:, 0],
                       color=color,
-                      label=band.label,
+                      label=format_kpoint_label(band.label),
                       s=band.marker_size,
                       marker=band.marker)
             # 其余带不带标签，一次性画出
@@ -186,7 +259,7 @@ def plot_bands(config: PlotConfig):
             # 第一条带带标签
             ax.plot(x_coords, data[:, 0],
                    color=color,
-                   label=band.label,
+                   label=format_kpoint_label(band.label),
                    linestyle=band.linestyle,
                    linewidth=band.linewidth)
             # 其余带不带标签，一次性画出
@@ -201,6 +274,8 @@ def plot_bands(config: PlotConfig):
     ax.set_xlim(x_coords[0], x_coords[-1])
     if config.ymin is not None and config.ymax is not None:
         ax.set_ylim(config.ymin, config.ymax)
+    if ymin is not None and ymax is not None:
+        ax.set_ylim(ymin, ymax)
     
     # 如果设置了费米能级，画一条水平线表示费米能级
     if config.fermi_energy is not None and config.fermi_line:
@@ -251,7 +326,7 @@ def main():
     parser.add_argument('--labels', nargs='+', help='Labels for each band')
     parser.add_argument('--colors', nargs='+', help='Colors for each band')
     parser.add_argument('--title', type=str, default='', help='Plot title')
-    parser.add_argument('--yrange', nargs=2, type=float, help='Y-axis range (min max)')
+    parser.add_argument('--energy-range', nargs=2, type=float, help='Y-axis range (min max)')
     parser.add_argument('--output', type=str, help='Output file')
     parser.add_argument('--plot-type', choices=['line', 'scatter'], 
                        help='Global plot type (line or scatter)')
@@ -276,6 +351,18 @@ def main():
             config_dict['bands'] = [BandConfig(**band) for band in config_dict['bands']]
             
         config = PlotConfig(**config_dict)
+        # 用命令行参数覆盖
+        if args.kpath_in: config.kpath_in = args.kpath_in
+        if args.kpath_out: config.kpath_out = args.kpath_out
+        if args.bands: config.bands = [BandConfig(file=band) for band in args.bands]
+        if args.title: config.title = args.title
+        if args.energy_range: config.ymin, config.ymax = args.energy_range
+        if args.output: config.output = args.output
+        if args.plot_type: config.global_plot_type = args.plot_type
+        if args.marker_size: config.marker_size = args.marker_size
+        if args.marker: config.marker = args.marker
+        if args.fermi is not None: config.fermi_energy = args.fermi
+        if args.no_fermi_line: config.fermi_line = False
     else:
         # 从命令行参数构建配置
         if not (args.kpath_in and args.kpath_out and args.bands):

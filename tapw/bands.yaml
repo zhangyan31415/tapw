@@ -1,14 +1,16 @@
 kpath_in: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.in"
 kpath_out: "/data/work/zy/software/1.tapw_code/tapw/tapw/KPATH_GMKG.out"
 title: "MoTe2 Band Structure"
-ymin: -0.5
-ymax: 0.1
-output: "bands_test.pdf"
-legend_show: true   #默认False
+ymin: -8.
+ymax: -4.
+output: "bands.pdf"
+legend_show: False   #默认False
 legend_loc: "upper right" 
-legend_fontsize: 9  #默认9
-global_plot_type: "line"  # 可选：全局设置所有band的绘图类型
-fermi_energy: -4.23  # 设置费米能级
+legend_fontsize: 8  #默认9
+global_plot_type: "scatter"  # 可选：全局设置所有band的绘图类型
+marker_size: 1
+marker: "o"
+fermi_energy: -0  # 设置费米能级
 fermi_line: true   # 是否画费米能级线
 
 bands:

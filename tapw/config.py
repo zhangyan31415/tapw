@@ -16,21 +16,17 @@ class TwistConfig:
 @dataclass
 class PathConfig:
     """Configuration for file paths"""
-    base_path: str
+    H_file: str
+    S_file: str
     input_file: str
     output_dir: str
-    kpath: str = field(default="/data/work/twistproject/1.triangular_lattice/1.homo/2.WSe2/AA/5.tapw_with_input_from_deeph_model/Y.source/KPATH_GMKG.in")
-    kpath_out: str = field(default="/data/work/twistproject/1.triangular_lattice/1.homo/2.WSe2/AA/5.tapw_with_input_from_deeph_model/Y.source/KPATH_GMKG.out")
-    H_path: str = field(init=False)
-    S_path: str = field(init=False)
+    kpath_in: str
+    kpath_out: str
 
     def __post_init__(self):
-        # Create absolute paths
-        self.base_path = os.path.abspath(self.base_path)
-        self.output_dir = os.path.abspath(os.path.join(self.base_path, self.output_dir))
-        self.H_path = os.path.join(self.base_path, "H.dat")
-        self.S_path = os.path.join(self.base_path, "S.dat")
-        # Create output directory
+        self.H_file = os.path.abspath(self.H_file)
+        self.S_file = os.path.abspath(self.S_file)
+        self.output_dir = os.path.abspath(self.output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
 
 @dataclass
@@ -128,13 +124,16 @@ class Config:
         compute_config = ComputeConfig(**config_dict.get('compute', {}))
         # Use default cluster config if not provided
         cluster_config = ClusterConfig(**config_dict.get('cluster', {})) if 'cluster' in config_dict else ClusterConfig()
-        
-        return cls(
+        config_obj = cls(
             twist=twist_config,
             paths=paths_config,
             compute=compute_config,
             cluster=cluster_config
         )
+        # 如果config.yaml没有n_g字段，则自动调用update_ng
+        if 'n_g' not in config_dict.get('compute', {}):
+            config_obj.update_ng()
+        return config_obj
 
     def save_yaml(self, yaml_path: str):
         """Save configuration to YAML file"""
@@ -148,23 +147,23 @@ class Config:
         with open(yaml_path, 'w') as f:
             yaml.dump(config_dict, f, default_flow_style=False)
 
-    def update_efermi_ng(self):
-        """Update efermi and n_g based on twist angle"""
+    def update_ng(self):
+        """Update n_g based on twist angle"""
         angle = float(self.twist.twist_angle)
         if angle > 9:
             self.compute.n_g = 3
         elif angle > 6:
-            self.compute.efermi = -0.17
+            # self.compute.efermi = -0.17
             self.compute.n_g = 6
         elif angle > 4:
-            self.compute.efermi = -0.172
+            # self.compute.efermi = -0.172
             self.compute.n_g = 7
-        elif angle > 3:
-            self.compute.efermi = -0.178
-            self.compute.n_g = 9
+        elif angle > 2.8:
+            # self.compute.efermi = -0.178
+            self.compute.n_g = 8
         elif angle > 2:
             self.compute.efermi = -0.18
-            self.compute.n_g = 8
+            self.compute.n_g = 9
         elif angle > 1:
             self.compute.efermi = -0.18
-            self.compute.n_g = 8 
+            self.compute.n_g = 10 

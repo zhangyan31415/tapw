@@ -13,6 +13,7 @@ from .C3_symm_01 import C3_MoTe2_all,C3_G_matrix
 from tqdm import tqdm
 from functools import wraps
 # import cupy as cp
+from .config import ComputeConfig
 from .read_pos_01 import StructureProcessor
 from .read_kpath_01 import KPathGenerator
 import psutil
@@ -78,7 +79,7 @@ def timing_decorator_factory(process_id):
         return wrapper
     return timing_decorator
 
-class Config:
+class Config_old:
     def __init__(self, 
                  efermi=-0.16617994221559068, TAPW=True, eigsh_cal=True, valley=1,
                  C3_H=False, ge=False, n_g=4, num_processes=2, eig_vec_cal=True,
@@ -138,7 +139,7 @@ class Config:
         self.symm_flag = symm_flag[self.C3_H]
 
 class TAPW_parameters:
-    def __init__(self, structure:StructureProcessor, config:Config):
+    def __init__(self, structure:StructureProcessor, config:ComputeConfig):
 
         self.config = config
         self.n_g = self.config.n_g
@@ -162,6 +163,10 @@ class TAPW_parameters:
         """Calculate the K1 and K2 points."""
         m_g_unitvec_1 = self.structure.reciprocal_Tmat[0][:2]
         m_g_unitvec_2 = self.structure.reciprocal_Tmat[1][:2]
+        if self.structure.reciprocal_Tmat[0]@self.structure.reciprocal_Tmat[1] < 0:
+            m_g_unitvec_1 = - self.structure.reciprocal_Tmat[0][:2]
+        else:
+            m_g_unitvec_1 = self.structure.reciprocal_Tmat[0][:2]
         n_moire = self.structure.twist_index
         offset = -n_moire*m_g_unitvec_1+n_moire*m_g_unitvec_2
 
@@ -281,6 +286,10 @@ class TAPW_parameters:
         """Generate the g_vec_list for K1 and K2."""
         m_g_unitvec_1 = -self.structure.reciprocal_Tmat[0][:2]
         m_g_unitvec_2 = self.structure.reciprocal_Tmat[1][:2]
+        if self.structure.reciprocal_Tmat[0]@self.structure.reciprocal_Tmat[1] < 0:
+            m_g_unitvec_1 = self.structure.reciprocal_Tmat[0][:2]
+        else:
+            m_g_unitvec_1 = -self.structure.reciprocal_Tmat[0][:2]
 
         K1, K2, m_K1, m_K2, offset = self.calculate_K_points()
         self.K1, self.K2 = K1, K2
@@ -699,7 +708,7 @@ class BandStructureCalculator:
         33: "M3"
     }
 
-    def __init__(self, hr_supercell, sr_supercell, structure:StructureProcessor, config:Config, kpath_config:KPathGenerator=None):
+    def __init__(self, hr_supercell, sr_supercell, structure:StructureProcessor, config:ComputeConfig, kpath_config:KPathGenerator=None):
         """Initialize the calculator
         
         Args:
@@ -742,20 +751,23 @@ class BandStructureCalculator:
         Returns:
             numpy.ndarray: Array of k-points in the first Brillouin zone
         """
-        a1 = np.array([2/3, -1/3, 0])
-        a2 = np.array([-1/3, 2/3, 0])
+        # a1 = np.array([2/3, -1/3, 0])
+        # a2 = np.array([-1/3, 2/3, 0])
         
         # Generate uniform mesh
-        kx = np.linspace(0, 1, num_k, endpoint=False)
-        ky = np.linspace(0, 1, num_k, endpoint=False)
-        kx, ky = np.meshgrid(kx, ky)
+        kx = np.linspace(-1, 1, num_k, endpoint=True)
+        ky = np.linspace(-1, 1, num_k, endpoint=True)
+        # kx, ky = np.meshgrid(kx, ky)
         
         # Convert to cartesian coordinates
-        kpoints = np.zeros((num_k * num_k, 3))
-        for i in range(num_k):
-            for j in range(num_k):
-                k = kx[i,j] * a1 + ky[i,j] * a2
-                kpoints[i*num_k + j] = k
+        # kpoints = np.zeros((num_k * num_k, 3))
+        # for i in range(num_k):
+        #     for j in range(num_k):
+        #         k = kx[i,j] * a1 + ky[i,j] * a2
+        #         kpoints[i*num_k + j] = k
+        K_mesh = np.meshgrid(kx, ky)
+        kpoints = np.array(K_mesh).reshape(2, -1).T
+        kpoints = np.hstack((kpoints, np.zeros((kpoints.shape[0], 1))))
         
         return kpoints
 
@@ -791,16 +803,21 @@ class BandStructureCalculator:
         # Save results
         # band_data = np.column_stack((kpoints, self.result['eig']))
         band_data = self.result['eig']
-        np.savetxt(os.path.join(path, f"band_data/band_data_{self.valley_flag}_valley.txt"),
+        suffix = "_2d" if getattr(self.config, "mode", None) == "chern" else ""
+        # 在chern模式下，添加num_chern标识
+        if getattr(self.config, "mode", None) == "chern" and hasattr(self.config, "num_chern"):
+            suffix += f"_{self.config.num_chern}"
+        # 保存主能带数据
+        np.savetxt(os.path.join(path, f"band_data/band_data_{self.valley_flag}_valley{suffix}.txt"),
                   band_data, fmt='%15.11f')
         
         # Save eigenvectors if calculated
         if self.config.eig_vec_cal:
-            np.save(os.path.join(path, f"vec_{self.valley_flag}"), self.result['vec'])
+            np.save(os.path.join(path, f"vec_{self.valley_flag}_valley{suffix}"), self.result['vec'])
         
         # Save Hamiltonian if requested
         if self.config.hamk_save:
-            np.save(os.path.join(path, f"hamk_{self.valley_flag}"), self.result['hamk'])
+            np.save(os.path.join(path, f"hamk_{self.valley_flag}_valley{suffix}"), self.result['hamk'])
 
     def calculate_chern(self, path):
         """Calculate Chern number using uniform k-point mesh
@@ -810,6 +827,8 @@ class BandStructureCalculator:
         """
         # Generate uniform k-point mesh
         kpoints = self.generate_kmesh(self.config.num_chern)
+        print("kpoints shape = ",kpoints.shape)
+        print("kpoints = ",kpoints)
         
         # Calculate band structure on the mesh
         self.calculate_band_structure(path, kpoints)
@@ -2046,58 +2065,7 @@ class BandStructureCalculator:
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         print(f"Current Time: {current_time}")
 
-    @timing_decorator_factory(process_id=0)
-    def calculate_band_structure_(self, path,kpoints=None):
-        if kpoints is None:
-            kpoints = self.kpath_config.kpoints
-        print(f"valley = shit {self.config.valley_flag}")
-        if self.config.TAPW:
-            np.save(os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.config.valley_flag}_1layer"), self.TAPW_parameters.g_vec_list_K1)
-            np.save(os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.config.valley_flag}_2layer"), self.TAPW_parameters.g_vec_list_K2)
-        self.parallel_calculate_band_01(kpoints)
-
-        # np.save(os.path.join(path, f"band_valley_{self.config.valley}_{self.config.n_g}_{self.config.eigsh_cal}_{self.config.num_bands_cal}_{self.config.TAPW}_{self.config.C3_H}_{self.config.ge}_{self.config.end_flag}"), band_valley_G)
-        # np.save(os.path.join(path, f"band_valley_{self.valley}_{self.n_g}_{self.spin}_{self.eigsh_cal}_{self.num_bands_cal}_{self.TAPW}_{self.C3_H}_{self.ge}_{self.end_flag}"), band_valley_G)
-        output_path = os.path.join(path, f"band_{self.config.valley_flag}_shell_{self.config.n_g}_{self.config.eq_flag}_{self.config.symm_flag}_{self.config.solve_flag}_{self.config.num_bands_cal}_{self.config.end_flag}")
-        output_vec_path = os.path.join(path, f"band_{self.config.valley_flag}_shell_{self.config.n_g}_{self.config.eq_flag}_{self.config.symm_flag}_{self.config.solve_flag}_{self.config.num_bands_cal}_{self.config.end_flag}_vec")
-        output_hamk_path = os.path.join(path, f"band_{self.config.valley_flag}_shell_{self.config.n_g}_{self.config.eq_flag}_{self.config.symm_flag}_{self.config.solve_flag}_{self.config.num_bands_cal}_{self.config.end_flag}_hamk")
-        
-        band_data = self.result['eig']
-        np.save(output_path, band_data)
-
-        efermi = np.max(np.max(band_data))
-        band_data = (band_data - efermi)*hartree
-        # if not os.path.exists(path+f"/band_data"):
-        #     os.mkdir(path+f"/band_data")
-        os.makedirs(os.path.join(path, "band_data"), exist_ok=True)
-        np.savetxt(path+f"/band_data/band_data_{self.config.valley_flag}_valley.txt",band_data,fmt='%15.11f')
-
-        if self.config.eig_vec_cal:
-            vec = self.result['vec']
-            np.save(output_vec_path, vec)
-            # self.write_wave_function_spin(path)
-        if self.config.hamk_save:
-            hamk = self.result['hamk']
-            np.save(output_hamk_path, hamk)
-            # self.write_hamk_spin(path)
-        print("="*100)
-        max_key_length = max(len(key) for key in self.__dict__.keys()) + 5
-        
-        for key, value in self.config.__dict__.items():
-            print(f"{key.ljust(max_key_length)} =      {value}")
-        max_key_length = max(len(key) for key in self.structure.__dict__.keys()) + 5 
-        for key, value in self.structure.__dict__.items():
-            if key not in ['atomic_coordinates_data','sort_pos','sort_wann','A']:
-                if key == 'atomic_species_data':
-                    formatted_value = self.format_atomic_species_data(value,max_key_length)
-                    print(f"{key.ljust(max_key_length)} =   {formatted_value}")
-                elif isinstance(value, (np.ndarray, list)):
-                    value_str = np.array2string(np.array(value), separator=', ', precision=8, floatmode='fixed')
-                    value_str = value_str.replace('\n', '\n' + ' ' * (max_key_length + 5))
-                    print(f"{key.ljust(max_key_length)} =   {value_str}")
-                else:
-                    print(f"{key.ljust(max_key_length)} =   {value}")
-        
+     
     def write_wave_function_spin(self, path):
         """
         Write the wave function for all k-point and each spin to files.

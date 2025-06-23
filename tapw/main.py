@@ -36,6 +36,12 @@ def parse_args():
                        help='List of valleys to calculate (overrides config file)')
     parser.add_argument('--mode', choices=['band', 'chern'],
                        help='Calculation mode (overrides config file)')
+    parser.add_argument('--n_g', type=int,
+                       help='Harmonic of G vectors (overrides config file)')
+    parser.add_argument('--num_chern', type=int,
+                       help='Number of k-points for Chern number calculation (overrides config file)')
+    parser.add_argument('--num_processes', type=int,
+                       help='Number of processes (overrides config file)')
     return parser.parse_args()
 
 def main():
@@ -53,7 +59,12 @@ def main():
         config.compute.valleys = args.valleys
     if args.mode:
         config.compute.mode = args.mode
-    
+    if args.n_g:
+        config.compute.n_g = args.n_g
+    if args.num_chern:
+        config.compute.num_chern = args.num_chern
+    if args.num_processes:
+        config.compute.num_processes = args.num_processes
     # Setup logging
     log_file = Path(config.paths.output_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
     logger = setup_logging(str(log_file))
@@ -62,11 +73,14 @@ def main():
     logger.info(f"Output directory: {config.paths.output_dir}")
     logger.info(f"Valleys to calculate: {config.compute.valleys}")
     logger.info(f"Calculation mode: {config.compute.mode}")
-
+    logger.info(f"Harmonic of G vectors: {config.compute.n_g}")
+    if config.compute.mode == "chern":
+        logger.info(f"Number of k-points for Chern number calculation: {config.compute.num_chern}x{config.compute.num_chern}")
+        logger.info(f"Number of processes: {config.compute.num_processes}")
     try:
         # Initialize structure
         structure = OpenMXFile(
-            file_path=str(Path(config.paths.base_path) / config.paths.input_file),
+            file_path=str(Path(config.paths.input_file)),
             twist_index=config.twist.twist_index_m,
             spin=config.twist.spin
         )
@@ -111,28 +125,52 @@ def main():
         processor.plot_clusters_phase(save=True, save_path=config.paths.output_dir)
 
         # Handle Hamiltonian
-        H_handler = HrSparseHandler(
-            file_name=config.paths.H_path,
-            npz_file_name=str(Path(config.paths.base_path) / 'H.npz'),
-            A=processor.transformed_index_matrix,
-            read_from_npz=False
-        )
+        H_file = config.paths.H_file
+        if H_file.endswith('.npz'):
+            H_handler = HrSparseHandler(
+                file_name='',
+                npz_file_name=H_file,
+                A=processor.transformed_index_matrix,
+                read_from_npz=True
+            )
+        elif H_file.endswith('.dat'):
+            H_handler = HrSparseHandler(
+                file_name=H_file,
+                npz_file_name='',
+                A=processor.transformed_index_matrix,
+                read_from_npz=False
+            )
+        else:
+            logger.error(f"H_file后缀必须为.npz或.dat，当前为: {H_file}")
+            sys.exit(1)
         hr = H_handler.get_hr_sparse()
 
         # Handle overlap matrix
-        S_handler = HrSparseHandler(
-            file_name=config.paths.S_path,
-            npz_file_name=str(Path(config.paths.base_path) / 'S.npz'),
-            A=processor.transformed_index_matrix,
-            read_from_npz=False
-        )
+        S_file = config.paths.S_file
+        if S_file.endswith('.npz'):
+            S_handler = HrSparseHandler(
+                file_name='',
+                npz_file_name=S_file,
+                A=processor.transformed_index_matrix,
+                read_from_npz=True
+            )
+        elif S_file.endswith('.dat'):
+            S_handler = HrSparseHandler(
+                file_name=S_file,
+                npz_file_name='',
+                A=processor.transformed_index_matrix,
+                read_from_npz=False
+            )
+        else:
+            logger.error(f"S_file后缀必须为.npz或.dat，当前为: {S_file}")
+            sys.exit(1)
         sr = S_handler.get_hr_sparse()
 
         # Initialize k-path if needed
         kpath_config = None
         if config.compute.mode == "band":
             kpath_config = KPathGenerator(structure.Tmat)
-            kpath_config.read_and_generate_kpath(config.paths.kpath, config.paths.kpath_out)
+            kpath_config.read_and_generate_kpath(config.paths.kpath_in, config.paths.kpath_out)
 
         # Calculate for each valley
         for valley in config.compute.valleys:

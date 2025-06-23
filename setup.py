@@ -20,6 +20,8 @@ setup(
         'console_scripts': [
             'tapw-calc=tapw.main:main',
             'tapw-plot=tapw.plot_band_01:main',
+            'tapw-config=tapw.config_generator:main',
+            'tapw-chernpost=tapw.chern_post:main',
         ],
     },
     author="Your Name",
@@ -34,4 +36,7 @@ setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.7",
+    package_data={
+        'tapw': ['*.yaml', '*.in'],
+    },
 ) 
