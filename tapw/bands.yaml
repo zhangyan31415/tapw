@@ -10,7 +10,7 @@ legend_fontsize: 8  #默认9
 global_plot_type: "scatter"  # 可选：全局设置所有band的绘图类型
 marker_size: 1
 marker: "o"
-fermi_energy: -0  # 设置费米能级
+fermi_energy: -4.6  # 设置费米能级
 fermi_line: true   # 是否画费米能级线
 
 bands:

@@ -35,7 +35,7 @@ pip install -e .
 ```bash
 tapw-config -o output_dir
 ```
-and then you can edit the `config.yaml` and `bands.yaml` files in the output_dir.
+and then you can edit the `config.yaml` and `bands.yaml` files in the output_dir, especially the `config.yaml` file, you must set the `H.dat` ,`S.dat` and `openmx.dat` files path.
 
 2. Run the calculation:
 ```bash
