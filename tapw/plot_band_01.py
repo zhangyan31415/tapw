@@ -21,7 +21,7 @@ class BandConfig:
     linestyle: str = '-'
     linewidth: float = 1.5
     plot_type: str = 'line'  # 'line' 或 'scatter'
-    marker_size: float = 20  # 散点大小
+    marker_size: float = 1  # 散点大小
     marker: str = 'o'      # 散点形状
 
 @dataclass
@@ -37,7 +37,7 @@ class PlotConfig:
     legend_show: bool = False  # 添加是否显示图例的配置
     legend_fontsize: int = 9   # 添加图例字体大小的配置
     global_plot_type: Optional[str] = None  # 全局设置，会覆盖单个band的设置
-    marker_size: float = 20
+    marker_size: float = 1
     marker: str = 'o'
     fermi_energy: Optional[float] = None  # 添加费米能级
     fermi_line: bool = True  # 是否画费米能级的水平线
@@ -239,7 +239,10 @@ def plot_bands(config: PlotConfig):
             raise ValueError(f"Band data length ({len(data)}) does not match k-points length ({len(x_coords)})")
         
         # 使用全局设置或单个band的设置
-        plot_type = config.global_plot_type or band.plot_type
+        if config.global_plot_type is not None:
+            plot_type = config.global_plot_type
+        else:
+            plot_type = band.plot_type
         
         if plot_type == 'scatter':
             # 第一条带带标签
@@ -330,7 +333,7 @@ def main():
     parser.add_argument('--output', type=str, help='Output file')
     parser.add_argument('--plot-type', choices=['line', 'scatter'], 
                        help='Global plot type (line or scatter)')
-    parser.add_argument('--marker-size', type=float, default=20,
+    parser.add_argument('--marker-size', type=float, default=1,
                        help='Marker size for scatter plot')
     parser.add_argument('--marker', default='o',
                        help='Marker style for scatter plot')
