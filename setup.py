@@ -15,6 +15,8 @@ setup(
         "tqdm>=4.60.0",
         "psutil>=5.8.0",
         "memory_profiler>=0.58.0",
+        "numba>=0.59.0",
+        "sympy>=1.13.0",
     ],
     entry_points={
         'console_scripts': [
