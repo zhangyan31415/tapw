@@ -41,7 +41,6 @@ class OpenMXFile:
         self.calc_twist_angle()
         self.calc_num_unit_cell()
         self.parse_file()
-        # print(self.species_coordinates)
         self.sort_atoms_by_z()
         self.compute_permutation_matrix()
         self.count_species()
@@ -352,7 +351,6 @@ class LayeredLatticeAnalyzer:
         """
         data = []
         for item in self.input_data:
-            # print(item)
             index = item['original_index']
             species = item['species']
             x, y, z = item['x'],item['y'],item['z']
@@ -387,6 +385,21 @@ class LayeredLatticeAnalyzer:
         Adds:
             'layer' column to self.df.
         """
+        def assign_twist_groups(layer_indices, twist_layer):
+            """
+            layer_indices: 已经按z均值排序后的层编号（如[0,1,2,3]）
+            twist_layer: 例如[1,2,1]
+            返回：每个层编号对应的组号
+            """
+            group_labels = []
+            current = 0
+            for group, count in enumerate(twist_layer):
+                for _ in range(count):
+                    group_labels.append(group)
+                    current += 1
+            return {layer: group_labels[i] for i, layer in enumerate(layer_indices)}
+        
+        
         if self.df is None:
             raise ValueError("DataFrame is empty. Please load data first.")
         
@@ -410,15 +423,19 @@ class LayeredLatticeAnalyzer:
         
         # Apply the mapping to ensure layers are ordered from bottom to top
         self.df['layer'] = self.df['layer'].map(label_mapping)
-        self.df['layer'] = self.df['layer'].apply(lambda x: 0 if x < self.twist_layer[0] else 1)
+        # self.df['layer'] = self.df['layer'].apply(lambda x: 0 if x < self.twist_layer[0] else 1)
+        group_mapping = assign_twist_groups(sorted(label_mapping.values()), self.twist_layer)
+        self.df['layer'] = self.df['layer'].map(group_mapping)
         for i, item in enumerate(self.input_data):
             self.input_data[i]['layer'] = self.df.loc[i, 'layer']
         # Print summary of layer separation
-        print(f"Separated into 2 layers with {self.df.shape[0]} atoms.")
-        for i in range(2):
+        # print(f"Separated into 2 layers with {self.df.shape[0]} atoms.")
+        print(f"Separated into {len(self.twist_layer)} layers with {self.df.shape[0]} atoms.")
+        for i in range(len(self.twist_layer)):
             num_atoms = self.df[self.df['layer'] == i].shape[0]
             print(f"Layer {i}: {num_atoms} atoms.")
 
+    
 
     def compute_lattice_vectors(self):
         """
@@ -428,7 +445,7 @@ class LayeredLatticeAnalyzer:
             raise ValueError("Layers are not separated. Please run separate_layers() first.")
         twist_angle_list = []
         current_angle = 0
-        for layer in range(2):
+        for layer in range(len(self.twist_layer)):
             # layer_atoms = self.df[self.df['layer'] == layer][['x', 'y', 'z']].values
             # if len(layer_atoms) < 2:
             #     print(f"Layer {layer}: Not enough atoms to determine lattice vectors.")
@@ -763,7 +780,7 @@ class LayeredLatticeAnalyzer:
         """
         # 根据层数决定子图布局
         if layer is None:
-            num_layers = 2  # 假设 self.num_layers 已定义
+            num_layers = len(self.twist_layer)  # 假设 self.num_layers 已定义
             rows = (num_layers + 1) // 2  # 行数
             cols = 2 if num_layers > 1 else 1  # 列数
             fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 6 * rows))
@@ -1246,7 +1263,7 @@ class LayeredLatticeAnalyzer:
         # scale = np.sqrt(3) if m ==2 else 1
         theta = 30 if self.type_structure[layer] == 1 else 0
         scale = np.sqrt(3) if self.type_structure[layer] == 1 else 1
-        if np.degrees(np.arctan2(rotated_basis_vectors[0,1], rotated_basis_vectors[0,0])) > 30:
+        if np.degrees(np.arctan2(rotated_basis_vectors[0,1], rotated_basis_vectors[0,0])) > 30*0.95:
             theta = - theta
         
         final_a1 = np.mean(rotated_basis_vectors, axis=0)
@@ -1254,7 +1271,8 @@ class LayeredLatticeAnalyzer:
         final_a2 = self.rot_z(final_a1, np.pi / 3)  # Rotate a1 by 60 degrees
 
         self.lattice_vectors[layer] = np.array([final_a1, final_a2])
-
+        # print("rotated_basis_vectors = ", rotated_basis_vectors)
+        # print("theta = ", theta)
         # print(f"Final basis vectors:\na1 = {final_a1}\na2 = {final_a2}")
 
         return final_a1, final_a2
@@ -1630,6 +1648,20 @@ class StructureProcessor:
         Adds:
             'layer' column to self.df.
         """
+        def assign_twist_groups(layer_indices, twist_layer):
+            """
+            layer_indices: 已经按z均值排序后的层编号（如[0,1,2,3]）
+            twist_layer: 例如[1,2,1]
+            返回：每个层编号对应的组号
+            """
+            group_labels = []
+            current = 0
+            for group, count in enumerate(twist_layer):
+                for _ in range(count):
+                    group_labels.append(group)
+                    current += 1
+            return {layer: group_labels[i] for i, layer in enumerate(layer_indices)}
+
         if self.df is None:
             raise ValueError("DataFrame is empty. Please load data first.")
         
@@ -1653,11 +1685,15 @@ class StructureProcessor:
         
         # Apply the mapping to ensure layers are ordered from bottom to top
         self.df['layer'] = self.df['layer'].map(label_mapping)
-        self.df['layer'] = self.df['layer'].apply(lambda x: 0 if x < self.twist_layer[0] else 1)
-        
+        # self.df['layer'] = self.df['layer'].apply(lambda x: 0 if x < self.twist_layer[0] else 1)
+        group_mapping = assign_twist_groups(sorted(label_mapping.values()), self.twist_layer)
+        self.df['layer'] = self.df['layer'].map(group_mapping)
+        for i, item in enumerate(self.input_data):
+            self.input_data[i]['layer'] = self.df.loc[i, 'layer']
         # Print summary of layer separation
-        print(f"Separated into 2 layers with {self.df.shape[0]} atoms.")
-        for i in range(2):
+        # print(f"Separated into 2 layers with {self.df.shape[0]} atoms.")
+        print(f"Separated into {len(self.twist_layer)} layers with {self.df.shape[0]} atoms.")
+        for i in range(len(self.twist_layer)):
             num_atoms = self.df[self.df['layer'] == i].shape[0]
             print(f"Layer {i}: {num_atoms} atoms.")
 
@@ -1774,7 +1810,7 @@ class StructureProcessor:
         cmap = matplotlib.colormaps['viridis']
         colors = cmap(np.linspace(0, 1, len(unique_labels_sorted)))
 
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+        fig, ax = plt.subplots(1, len(self.twist_layer), figsize=(12, 4))
         kx = np.arange(len(phase_normalized1))
 
         for i, label in enumerate(unique_labels_sorted):
@@ -1789,7 +1825,7 @@ class StructureProcessor:
             ax[0].scatter(kx[mask_atom], phase_normalized1[mask_atom], color=color, label=label_name, s=5)
             ax[1].scatter(kx[mask_atom], phase_normalized2[mask_atom], color=color, label=label_name, s=5)
 
-        for i in range(2):
+        for i in range(len(self.twist_layer)):
             ax[i].axhline(0, color='black', linestyle='--')
             ax[i].axhline(self.period, color='black', linestyle='--')
             ax[i].set_xlabel('Atom Index')
@@ -1982,7 +2018,7 @@ class StructureProcessor:
         period_deg = (self.period * 180 / np.pi) % 360
 
 
-        fig, ax = plt.subplots(1, 2, figsize=(15, 4))
+        fig, ax = plt.subplots(1, len(self.twist_layer), figsize=(15, 4))
         unique_labels = sorted(self.df['atom_type'].unique())
         colors = plt.get_cmap('tab10', len(unique_labels))
 
@@ -2050,7 +2086,7 @@ class StructureProcessor:
         """
         self.phase1 = np.zeros(self.df.shape[0])
         self.phase2 = np.zeros(self.df.shape[0])
-        for i in range(2):
+        for i in range(len(self.twist_layer)):
             b1, b2 = self.monolayer_reciprocal_list[i]
             mask = self.df['layer'] == i
             self.phase1[mask] = (self.df.loc[mask, 'x'] * b1[0] + self.df.loc[mask, 'y'] * b1[1]) % self.period

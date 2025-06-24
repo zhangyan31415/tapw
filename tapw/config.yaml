@@ -55,3 +55,10 @@ compute:
   C3_H: false           # Apply C3 symmetry to Hamiltonian
   ge: false             # Use generalized eigenvalue solver
   eig_vec_cal: true     # Calculate eigenvectors 
+
+  # Electric field parameters
+  Electric_field_in_eVpA: 0.005  # Electric field strength in eV/Å
+  zero_potential_layers: [1]     # Layers with zero potential
+  Inner_symmetrical_Electric_Field: true  # Whether to use inner symmetrical electric field
+
+  orthogonal_basis: true

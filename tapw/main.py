@@ -146,25 +146,33 @@ def main():
         hr = H_handler.get_hr_sparse()
 
         # Handle overlap matrix
-        S_file = config.paths.S_file
-        if S_file.endswith('.npz'):
-            S_handler = HrSparseHandler(
-                file_name='',
-                npz_file_name=S_file,
-                A=processor.transformed_index_matrix,
-                read_from_npz=True
-            )
-        elif S_file.endswith('.dat'):
-            S_handler = HrSparseHandler(
-                file_name=S_file,
-                npz_file_name='',
-                A=processor.transformed_index_matrix,
-                read_from_npz=False
-            )
+        if config.compute.orthogonal_basis:
+            sr = None
         else:
-            logger.error(f"S_file后缀必须为.npz或.dat，当前为: {S_file}")
-            sys.exit(1)
-        sr = S_handler.get_hr_sparse()
+            S_file = config.paths.S_file
+            if S_file is not None:
+                if S_file.endswith('.npz'):
+                    S_handler = HrSparseHandler(
+                        file_name='',
+                        npz_file_name=S_file,
+                        A=processor.transformed_index_matrix,
+                        read_from_npz=True
+                    )
+                    sr = S_handler.get_hr_sparse()
+                elif S_file.endswith('.dat'):
+                    S_handler = HrSparseHandler(
+                        file_name=S_file,
+                        npz_file_name='',
+                        A=processor.transformed_index_matrix,
+                        read_from_npz=False
+                    )
+                    sr = S_handler.get_hr_sparse()
+                else:
+                    logger.error(f"S_file后缀必须为.npz或.dat，当前为: {S_file}")
+                    sys.exit(1)
+            else:
+                logger.info("S_file is None, please check the config.yaml")
+                sys.exit(1)
 
         # Initialize k-path if needed
         kpath_config = None

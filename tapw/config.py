@@ -17,17 +17,34 @@ class TwistConfig:
 class PathConfig:
     """Configuration for file paths"""
     H_file: str
-    S_file: str
     input_file: str
     output_dir: str
     kpath_in: str
     kpath_out: str
+    S_file: Optional[str] = None
 
     def __post_init__(self):
         self.H_file = os.path.abspath(self.H_file)
-        self.S_file = os.path.abspath(self.S_file)
+        if self.S_file is not None:
+            self.S_file = os.path.abspath(self.S_file)
         self.output_dir = os.path.abspath(self.output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
+        # 新增：如果不是正交基底，S_file 必须存在
+        from .config import ComputeConfig
+        import inspect
+        # 尝试获取调用栈中的Config对象
+        frame = inspect.currentframe()
+        while frame:
+            local_vars = frame.f_locals
+            if 'self' in local_vars and hasattr(local_vars['self'], 'compute'):
+                compute = local_vars['self'].compute
+                break
+            frame = frame.f_back
+        else:
+            compute = None
+        if compute is not None and not getattr(compute, 'orthogonal_basis', False):
+            if self.S_file is None or not os.path.isfile(self.S_file):
+                raise ValueError("S_file must be provided and exist when not using orthogonal basis.")
 
 @dataclass
 class ClusterConfig:
@@ -70,7 +87,10 @@ class ComputeConfig:
     eq_flag: str = field(init=False)  # Equation flag
     symm_flag: str = field(init=False)  # Symmetry flag
     gpu_num: int = field(init=False)  # Number of GPUs
-
+    Electric_field_in_eVpA: Optional[float] = None  # 电场强度 (eV/Å)
+    zero_potential_layers: Optional[List[int]] = None  # 选择的层数（用于确定零势能面）
+    Inner_symmetrical_Electric_Field: bool = False  # 是否加内对称电场
+    orthogonal_basis: bool = False  # 是否使用正交基底，正交时S矩阵可以省略
     def __post_init__(self):
         # Valley mapping
         valley_flag = {
