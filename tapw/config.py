@@ -30,7 +30,7 @@ class PathConfig:
         self.output_dir = os.path.abspath(self.output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
         # 新增：如果不是正交基底，S_file 必须存在
-        from .config import ComputeConfig
+        # from .config import ComputeConfig
         import inspect
         # 尝试获取调用栈中的Config对象
         frame = inspect.currentframe()
@@ -45,6 +45,37 @@ class PathConfig:
         if compute is not None and not getattr(compute, 'orthogonal_basis', False):
             if self.S_file is None or not os.path.isfile(self.S_file):
                 raise ValueError("S_file must be provided and exist when not using orthogonal basis.")
+
+@dataclass
+class SlabConfig:
+    """Configuration for slab calculations"""
+    nslab: int = 7  # Number of layers in the slab
+    ijmax: int = 1  # Maximum interlayer distance (for twisted materials)
+    slab_direction: List[int] = field(default_factory=lambda: [0, 1, 0])  # Slab normal direction vector [x,y,z]
+    analyze_surface: bool = True  # Whether to analyze surface character
+    surface_threshold: float = 0.5  # Threshold for identifying surface states
+    kpath_slab_in: str = "KPATH_SLAB.in"  # Slab k-path input file
+    kpath_slab_out: str = "KPATH_SLAB.out"  # Slab k-path output file
+    
+    def __post_init__(self):
+        """Validate slab direction vector"""
+        if len(self.slab_direction) != 3:
+            raise ValueError("slab_direction must be a 3-element vector [x, y, z]")
+        
+        # Convert to list of integers
+        self.slab_direction = [int(x) for x in self.slab_direction]
+        
+        # Check that exactly one component is non-zero
+        non_zero_count = sum(1 for x in self.slab_direction if x != 0)
+        if non_zero_count != 1:
+            raise ValueError("slab_direction must have exactly one non-zero component (e.g., [0,1,0] for y-direction)")
+        
+        # Get direction index and name for convenience
+        self.direction_index = self.slab_direction.index(max(self.slab_direction, key=abs))
+        direction_names = ['x', 'y', 'z']
+        self.direction_name = direction_names[self.direction_index]
+        
+        print(f"Slab direction: {self.slab_direction} ({self.direction_name}-direction, index {self.direction_index})")
 
 @dataclass
 class ClusterConfig:
@@ -72,6 +103,7 @@ class ComputeConfig:
     num_processes: int = 50
     num_bands_cal: int = 50
     num_chern: int = 40
+    band_type: str = "CBM"  # Band type to analyze: "CBM" for conduction band minimum, "VBM" for valence band maximum
     gpu: bool = False
     gpu_index: List[int] = field(default_factory=lambda: [0, 1])
     delay_time: int = 4
@@ -132,6 +164,7 @@ class Config:
     paths: PathConfig
     compute: ComputeConfig
     cluster: ClusterConfig = field(default_factory=ClusterConfig)  # Use default values if not provided
+    slab: Optional[SlabConfig] = None  # Slab configuration (only used when mode="slab")
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> 'Config':
@@ -144,11 +177,18 @@ class Config:
         compute_config = ComputeConfig(**config_dict.get('compute', {}))
         # Use default cluster config if not provided
         cluster_config = ClusterConfig(**config_dict.get('cluster', {})) if 'cluster' in config_dict else ClusterConfig()
+        
+        # Load slab config if mode is "slab" or if slab section exists
+        slab_config = None
+        if (compute_config.mode == "slab"):
+            slab_config = SlabConfig(**config_dict.get('slab', {}))
+        
         config_obj = cls(
             twist=twist_config,
             paths=paths_config,
             compute=compute_config,
-            cluster=cluster_config
+            cluster=cluster_config,
+            slab=slab_config
         )
         # 如果config.yaml没有n_g字段，则自动调用update_ng
         if 'n_g' not in config_dict.get('compute', {}):
@@ -163,6 +203,10 @@ class Config:
             'compute': {k: v for k, v in self.compute.__dict__.items() if k != 'valley'}
             # Don't save cluster config as it uses fixed values
         }
+        
+        # Add slab config if it exists
+        if self.slab is not None:
+            config_dict['slab'] = self.slab.__dict__
         
         with open(yaml_path, 'w') as f:
             yaml.dump(config_dict, f, default_flow_style=False)

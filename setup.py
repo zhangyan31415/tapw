@@ -24,6 +24,8 @@ setup(
             'tapw-plot=tapw.plot_band_01:main',
             'tapw-config=tapw.config_generator:main',
             'tapw-chernpost=tapw.chern_post:main',
+            'tapw-orbital=tapw.orbital_analysis_tool:main',
+            'tapw-plot-orbital=tapw.plot_orbital_tool:main',
         ],
     },
     author="Your Name",

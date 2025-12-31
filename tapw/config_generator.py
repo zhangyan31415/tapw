@@ -26,8 +26,11 @@ yaml.add_representer(list, list_presenter)
 
 def get_default_config_path():
     """Get the path to the default config files in the package."""
-    config_yaml = str(files('tapw').joinpath('config.yaml'))
-    bands_yaml = str(files('tapw').joinpath('bands.yaml'))
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    config_yaml = os.path.join(current_dir, 'config.yaml')
+    bands_yaml = os.path.join(current_dir, 'bands.yaml')
+    # config_yaml = str(files('tapw').joinpath('config.yaml'))
+    # bands_yaml = str(files('tapw').joinpath('bands.yaml'))
     return config_yaml, bands_yaml
 
 def read_yaml_with_comments(file_path):
@@ -107,11 +110,11 @@ def customize_config(config_content, config_data, output_dir, use_logical_path):
     )
     
     # 更新 num_processes
-    config_content = re.sub(
-        r'(num_processes:).*',
-        f'\\1 {os.cpu_count() or 1}',
-        config_content
-    )
+    # config_content = re.sub(
+    #     r'(num_processes:).*',
+    #     f'\\1 {os.cpu_count() or 1}',
+    #     config_content
+    # )
     
     return config_content
 
@@ -165,7 +168,8 @@ def generate_config(output_dir='.', use_logical_path=True):
         f.write(bands_content)
     
     # 复制 KPATH 文件，但使用新的名字
-    kpath_in = str(files('tapw').joinpath('KPATH.in'))
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    kpath_in = os.path.join(current_dir, 'KPATH.in')
     shutil.copy2(kpath_in, os.path.join(output_dir, 'KPATH.in'))
     
     print(f"Configuration files generated in {output_dir}:")

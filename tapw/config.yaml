@@ -32,7 +32,7 @@ compute:
                           # 33: M3 valley
   
   # Calculation mode
-  mode: "band"            # Calculation mode: "band" for band structure, "chern" for Chern number
+  mode: "band"            # Calculation mode: "band" for band structure, "chern" for Chern number, "slab" for slab/ribbon calculation
   
   # Energy parameters
   efermi: -4.6           # Fermi energy level, unit: eV
@@ -40,7 +40,7 @@ compute:
   
   # Band structure calculation parameters
   num_processes: 61       # Number of parallel processes
-  num_bands_cal: 20      # Number of bands to calculate
+  num_bands_cal: 200      # Number of bands to calculate
   num_chern: 40          # Number of k-points for Chern number calculation (grid size will be num_chern x num_chern)
   
   # Hardware acceleration
@@ -57,8 +57,18 @@ compute:
   eig_vec_cal: true     # Calculate eigenvectors 
 
   # Electric field parameters
-  Electric_field_in_eVpA: 0.005  # Electric field strength in eV/Å
+  Electric_field_in_eVpA: 0.00  # Electric field strength in eV/Å
   zero_potential_layers: [1]     # Layers with zero potential
-  Inner_symmetrical_Electric_Field: true  # Whether to use inner symmetrical electric field
+  Inner_symmetrical_Electric_Field: false  # Whether to use inner symmetrical electric field
 
-  orthogonal_basis: true
+  orthogonal_basis: false
+
+# Slab calculation parameters (only used when mode: "slab")
+# slab:
+#   nslab: 7                    # Number of layers in the slab
+#   ijmax: 1                    # Maximum interlayer distance (for twisted materials)
+#   slab_direction: [0,1,0]     # Slab normal direction (010 cut)
+#   analyze_surface: false       # Whether to analyze surface character
+#   surface_threshold: 0.5      # Threshold for identifying surface states
+#   kpath_slab_in: "KPATH_SLAB.in"   # Slab k-path input file
+#   kpath_slab_out: "KPATH_SLAB.out" # Slab k-path output file

@@ -58,7 +58,8 @@ class TAPW_parameters:
 
         # 电场修正项
         self.electric_field_onsite = None  # shape: (num_atoms,)
-        self._compute_electric_field_onsite()
+        if self.config.Electric_field_in_eVpA or self.config.Inner_symmetrical_Electric_Field:
+            self._compute_electric_field_onsite()
 
     def _compute_electric_field_onsite(self):
         """
@@ -141,7 +142,8 @@ class TAPW_parameters:
         
         
         
-        
+        print("m_g_unitvec_1 = ", m_g_unitvec_1)
+        print("m_g_unitvec_2 = ", m_g_unitvec_2)
         offset = -n_moire * m_g_unitvec_1 + n_moire * m_g_unitvec_2
 
         m_K1 = -1/3 * m_g_unitvec_1 + 2/3 * m_g_unitvec_2
@@ -245,9 +247,12 @@ class TAPW_parameters:
         for i, vec in enumerate(o_g_vec_list_m_K2):
             if np.linalg.norm(vec) < K2_distance[n_g - 1] + 0.001:
                 g_vec_list_K2.append(o_g_vec_list[i] + offset)
-
+        g_vec_list_K1 = np.array(g_vec_list_K1)
+        g_vec_list_K2 = np.array(g_vec_list_K2)
         self.g_vec_list_K1 = np.array(g_vec_list_K1)
         self.g_vec_list_K2 = np.array(g_vec_list_K2)
+        # self.g_vec_list_K1 = np.concatenate([g_vec_list_K1, -g_vec_list_K1])
+        # self.g_vec_list_K2 = np.concatenate([g_vec_list_K2, -g_vec_list_K2])
 
         print(self.g_vec_list_K1)
         print("======================")
@@ -554,6 +559,7 @@ class TAPW_parameters:
         
         self.C3_matrix = scipy.sparse.csr_matrix(C3_MoTe2_rep)
         C3_matrix_2 = self.C3_matrix @ self.C3_matrix
+        np.save("C3_matrix",C3_MoTe2_rep)
         
         self.symm_matrix = [
             scipy.sparse.csr_matrix(np.eye(self.C3_matrix.shape[0])),
@@ -578,6 +584,7 @@ class TAPW_parameters:
         """Generate all TAPW parameters"""
         self.generate_g_vec_list()
         self.generate_gr_matrix()
+        self.generate_C3_matrix()
         if self.config.C3_H:
             self.generate_C3_matrix()
             self.generate_g_symm_matrix()
@@ -635,12 +642,106 @@ class BandStructureCalculator:
         """
         
         # Generate uniform mesh
-        kx = np.linspace(-1, 1, num_k, endpoint=True)
-        ky = np.linspace(-1, 1, num_k, endpoint=True)
+        kx = np.linspace(0, 1, num_k, endpoint=True)
+        ky = np.linspace(0, 1, num_k, endpoint=True)
+        kx = np.linspace(-0.5, 0.5, num_k, endpoint=True)
+        ky = np.linspace(-0.5, 0.5, num_k, endpoint=True)
         K_mesh = np.meshgrid(kx, ky)
         kpoints = np.array(K_mesh).reshape(2, -1).T
         kpoints = np.hstack((kpoints, np.zeros((kpoints.shape[0], 1))))
         return kpoints
+
+    def find_first_above_energy(self, energies, E):
+        """Find first band index above energy E for each k-point"""
+        idxs = []
+        for band in energies:  # band: (nb,)
+            idx = np.where(band > E)[0]
+            idxs.append(idx[0] if len(idx) > 0 else len(band))
+        return np.asarray(idxs, dtype=int)
+
+    def align_bands_by_index(self, energies, E):
+        """Align bands by first index above energy E"""
+        first_indices = self.find_first_above_energy(energies, E)
+        min_index = int(np.min(first_indices))
+        max_index = int(np.max(first_indices))
+        n_all = energies.shape[1]
+        n_keep = n_all - (max_index - min_index)
+
+        if n_keep <= 0:
+            raise ValueError(f"No bands to keep after alignment (n_keep={n_keep}). Check energy E={E}")
+
+        filtered = np.empty((energies.shape[0], n_keep), dtype=energies.dtype)
+        for i in range(energies.shape[0]):
+            start = first_indices[i] - min_index
+            end = start + n_keep
+            filtered[i] = energies[i, start:end]
+
+        pivot_col = min_index
+        return filtered, pivot_col
+
+    def split_vbm_cbm(self, energies, E):
+        """Split bands into VBM and CBM parts based on energy E"""
+        # Sort each k-point's energies
+        energies = np.sort(energies, axis=1)
+        
+        filtered, pivot_col = self.align_bands_by_index(energies, E)
+        vbm = filtered[:, :pivot_col] if pivot_col > 0 else np.array([]).reshape(energies.shape[0], 0)
+        cbm = filtered[:, pivot_col:] if pivot_col < filtered.shape[1] else np.array([]).reshape(energies.shape[0], 0)
+        
+        return filtered, vbm, cbm, pivot_col
+    
+    def split_vbm_cbm_with_vec(self, energies, vecs, E):
+        """Split bands and corresponding eigenvectors into VBM and CBM parts"""
+        # energies: (n_kpoints, n_bands)
+        # vecs: (n_kpoints, n_orbitals, n_bands) or list of (n_orbitals, n_bands)
+        
+        # Sort each k-point's energies and get sorting indices
+        sort_indices = np.argsort(energies, axis=1)
+        energies_sorted = np.sort(energies, axis=1)
+        
+        filtered_energies, pivot_col = self.align_bands_by_index(energies_sorted, E)
+        
+        # Split energies
+        vbm_energies = filtered_energies[:, :pivot_col] if pivot_col > 0 else np.array([]).reshape(energies.shape[0], 0)
+        cbm_energies = filtered_energies[:, pivot_col:] if pivot_col < filtered_energies.shape[1] else np.array([]).reshape(energies.shape[0], 0)
+        
+        # Split eigenvectors if provided
+        vbm_vecs = None
+        cbm_vecs = None
+        
+        if vecs is not None and len(vecs) > 0:
+            # Handle case where vecs is a list or array
+            if isinstance(vecs, list):
+                vecs_array = np.array(vecs)  # (n_kpoints, n_orbitals, n_bands)
+            else:
+                vecs_array = vecs
+            
+            # Get the alignment indices for each k-point
+            first_indices = self.find_first_above_energy(energies_sorted, E)
+            min_index = int(np.min(first_indices))
+            max_index = int(np.max(first_indices))
+            n_keep = energies.shape[1] - (max_index - min_index)
+            
+            if n_keep > 0:
+                # Sort eigenvectors according to energy sorting
+                vecs_sorted = np.zeros_like(vecs_array)
+                for k in range(vecs_array.shape[0]):
+                    vecs_sorted[k] = vecs_array[k][:, sort_indices[k]]
+                
+                # Align eigenvectors
+                vecs_filtered = np.zeros((vecs_array.shape[0], vecs_array.shape[1], n_keep), dtype=vecs_array.dtype)
+                for k in range(vecs_array.shape[0]):
+                    start = first_indices[k] - min_index
+                    end = start + n_keep
+                    vecs_filtered[k] = vecs_sorted[k][:, start:end]
+                
+                # Split eigenvectors
+                if pivot_col > 0:
+                    vbm_vecs = vecs_filtered[:, :, :pivot_col]
+                if pivot_col < vecs_filtered.shape[2]:
+                    cbm_vecs = vecs_filtered[:, :, pivot_col:]
+        
+        return filtered_energies, vbm_energies, cbm_energies, pivot_col, vbm_vecs, cbm_vecs
 
     def calculate_band_structure(self, path, kpoints=None):
         """Calculate band structure
@@ -652,7 +753,7 @@ class BandStructureCalculator:
         """
         # Create output directories
         os.makedirs(path, exist_ok=True)
-        os.makedirs(os.path.join(path, "band_data"), exist_ok=True)
+        # os.makedirs(os.path.join(path, "band_wave"), exist_ok=True)
         
         # Use provided k-points or generate from k-path
         if kpoints is None:
@@ -666,7 +767,9 @@ class BandStructureCalculator:
                    self.TAPW_parameters.g_vec_list_K1)
             np.save(os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.valley_flag}_2layer"),
                    self.TAPW_parameters.g_vec_list_K2)
-        
+        if self.config.C3_H:
+            np.save(os.path.join(path, f"C3_matrix_{self.valley_flag}"),
+                   self.TAPW_parameters.C3_matrix.toarray())
         # Calculate bands
         self.parallel_calculate_band_01(kpoints)
         
@@ -676,13 +779,33 @@ class BandStructureCalculator:
         # 在chern模式下，添加num_chern标识
         if getattr(self.config, "mode", None) == "chern" and hasattr(self.config, "num_chern"):
             suffix += f"_{self.config.num_chern}"
+            os.makedirs(os.path.join(path, "topo"), exist_ok=True)
+            path = os.path.join(path, "topo")
+        else:
+            os.makedirs(os.path.join(path, "band"), exist_ok=True)
+            path = os.path.join(path, "band")
         
-        np.savetxt(os.path.join(path, f"band_data/band_data_{self.valley_flag}_valley{suffix}.txt"),
-                  band_data, fmt='%15.11f')
+        # Split bands and eigenvectors by fermi energy
+        vec_data = self.result['vec'] if self.config.eig_vec_cal else None
+        filtered, vbm, cbm, pivot_col, vbm_vecs, cbm_vecs = self.split_vbm_cbm_with_vec(
+            band_data, vec_data, self.config.efermi)
+        
+        # Save VBM data if exists
+        if vbm.size > 0:
+            np.savetxt(os.path.join(path, f"band_VBM_{self.valley_flag}_valley{suffix}.txt"),
+                      vbm, fmt='%15.11f')
+        
+        # Save CBM data if exists  
+        if cbm.size > 0:
+            np.savetxt(os.path.join(path, f"band_CBM_{self.valley_flag}_valley{suffix}.txt"),
+                      cbm, fmt='%15.11f')
         
         # Save eigenvectors if calculated
         if self.config.eig_vec_cal:
-            np.save(os.path.join(path, f"vec_{self.valley_flag}_valley{suffix}"), self.result['vec'])
+            if vbm_vecs is not None and vbm_vecs.size > 0:
+                np.save(os.path.join(path, f"vec_VBM_{self.valley_flag}_valley{suffix}"), vbm_vecs)
+            if cbm_vecs is not None and cbm_vecs.size > 0:
+                np.save(os.path.join(path, f"vec_CBM_{self.valley_flag}_valley{suffix}"), cbm_vecs)
         
         # Save Hamiltonian if requested
         if self.config.hamk_save:
@@ -739,16 +862,17 @@ class BandStructureCalculator:
             temp[2] = vec[2]
             return temp
 
-    @timing_decorator_factory(process_id=0)
+    # @timing_decorator_factory(process_id=0)
     def get_kvec(self, k):
         """Get k vector in reciprocal space"""
         return np.dot(k, self.structure.reciprocal_Tmat)
 
     @timing_decorator_factory(process_id=0)
-    def Getk_super_gauge_sparse(self, Hr, k):
+    def Getk_super_gauge_sparse(self, Hr, k, type = "H"):
         """Get k-space Hamiltonian from real space Hamiltonian"""
         kvec = self.get_kvec(k)
-        
+        # print(self.structure.df)
+        # exit()
         sorted_wann_x = self.structure.df['x'].values
         sorted_wann_y = self.structure.df['y'].values
         sorted_wann_z = self.structure.df['z'].values
@@ -771,16 +895,18 @@ class BandStructureCalculator:
 
         # --- 电场修正：加到对角元 ---
         ef_onsite = None
-        if hasattr(self, 'TAPW_parameters') and self.TAPW_parameters.electric_field_onsite is not None:
-            # 需要扩展到所有轨道（每个原子有多个轨道）
-            orb_num = self.structure.df['orb_num'].values
-            ef_onsite = np.repeat(self.TAPW_parameters.electric_field_onsite, orb_num)
-            if self.structure.spin:
-                ef_onsite = np.tile(ef_onsite, 2)
-            print("orb_num = ", orb_num)
-            print("self.TAPW_parameters.electric_field_onsite = ", self.TAPW_parameters.electric_field_onsite)
-            print("ef_onsite = ", ef_onsite.shape,ef_onsite)
-            mk = mk + scipy.sparse.diags(ef_onsite, 0, shape=(num_wann, num_wann), dtype=np.float64)
+        if type == "H":
+            if hasattr(self, 'TAPW_parameters') and self.TAPW_parameters.electric_field_onsite is not None:
+                # 需要扩展到所有轨道（每个原子有多个轨道）
+                orb_num = self.structure.df['orb_num'].values
+                ef_onsite = np.repeat(self.TAPW_parameters.electric_field_onsite, orb_num)
+                if self.structure.spin:
+                    ef_onsite = np.tile(ef_onsite, 2)
+                # print("orb_num = ", orb_num)
+                # exit()
+                # print("self.TAPW_parameters.electric_field_onsite = ", self.TAPW_parameters.electric_field_onsite)
+                # print("ef_onsite = ", ef_onsite.shape,ef_onsite)
+                mk = mk + scipy.sparse.diags(ef_onsite, 0, shape=(num_wann, num_wann), dtype=np.float64)
         return mk
 
     @timing_decorator_factory(process_id=0)
@@ -864,12 +990,12 @@ class BandStructureCalculator:
     @timing_decorator_factory(process_id=0) 
     def Getk_super_gauge_sparse_final_HS(self, Hr, Sr, k, mpi_index):
         """Get final Hamiltonian for orthogonal or non-orthogonal basis (no symmetry)"""
-        Hk = self.Getk_super_gauge_sparse(Hr, k)
+        Hk = self.Getk_super_gauge_sparse(Hr, k, type = "H")
         Hk = self.cal_TAPW_hamiltonian_k(Hk)
         if self.config.orthogonal_basis:
             return Hk, None
         else:
-            Sk = self.Getk_super_gauge_sparse(Sr, k)
+            Sk = self.Getk_super_gauge_sparse(Sr, k, type = "S")
             Sk = self.cal_TAPW_hamiltonian_k(Sk)
             if not self.config.ge:
                 Hk = self.gen_H_new(Hk, Sk, mpi_index)
@@ -1014,8 +1140,10 @@ class BandStructureCalculator:
         else:
             if self.config.eigsh_cal:
                 if self.config.ge:
-                    hamk = self.Getk_super_gauge_sparse(self.hr_supercell, kpoints[:3])
-                    samk = self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3])
+                    hamk = self.Getk_super_gauge_sparse(self.hr_supercell, kpoints[:3], type = "H")
+                    samk = self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3], type = "S")
+                    hamk = hamk.toarray()
+                    samk = samk.toarray()
                     w = eigsh(hamk, k=self.config.num_bands_cal, M=samk, 
                              sigma=self.config.efermi, which='LM', 
                              return_eigenvectors=self.config.eig_vec_cal)
@@ -1094,15 +1222,15 @@ class BandStructureCalculator:
         band_wave = self.result['vec']
         print(np.shape(band_wave))
         
-        dir = os.path.join(path, f'{valley_flag}_valley')
+        dir = os.path.join(path, f'{self.config.band_type}_{valley_flag}_valley')
         os.makedirs(dir, exist_ok=True)
         
         num_gn_all = len(g_vec_list_K_1layer) * 2
         up_all_index, down_all_index = self.generate_indices(num_gn_all, num_Te, num_Mo, orb_num)
         print(up_all_index, down_all_index, band_wave.shape)
         
-        np.save(os.path.join(dir, f'{valley_flag}_valley_up.npy'), band_wave[:, up_all_index])
-        np.save(os.path.join(dir, f'{valley_flag}_valley_down.npy'), band_wave[:, down_all_index])
+        np.save(os.path.join(dir, f'{self.config.band_type}_{valley_flag}_valley_up.npy'), band_wave[:, up_all_index])
+        np.save(os.path.join(dir, f'{self.config.band_type}_{valley_flag}_valley_down.npy'), band_wave[:, down_all_index])
 
     def write_hamk_spin(self, path):
         """Write Hamiltonian matrix for all k-points and each spin to files"""
@@ -1132,7 +1260,7 @@ class BandStructureCalculator:
             H_spin_kpoints[1, i] = H_gamma_down
 
         os.makedirs(os.path.join(path, 'symm_Hprime_wave_npy'), exist_ok=True)
-        np.save(os.path.join(path, 'symm_Hprime_wave_npy', f'Hprime_up_down_{self.config.valley_flag}.npy'), 
+        np.save(os.path.join(path, 'symm_Hprime_wave_npy', f'Hprime_up_down_{self.config.band_type}_{self.config.valley_flag}.npy'), 
                 H_spin_kpoints)
 
     def write_wave_2col(self, path, vec, g_vec_list_1layer, g_vec_list_2layer, orb_Te, orb_Mo):

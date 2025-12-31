@@ -4,12 +4,13 @@ import logging
 import sys
 import time
 from pathlib import Path
-
+import os
 from .config import Config
 from .cal_ham_01 import BandStructureCalculator
 from .read_pos_01 import LayeredLatticeAnalyzer, StructureProcessor,OpenMXFile
 from .read_kpath_01 import KPathGenerator
 from .read_hr_01 import HrSparseHandler
+from .tapw_slab import TAPWSlab
 
 def setup_logging(log_file: str = None):
     """Setup logging configuration"""
@@ -34,7 +35,7 @@ def parse_args():
                        help='Output directory (overrides config file)')
     parser.add_argument('--valleys', type=int, nargs='+',
                        help='List of valleys to calculate (overrides config file)')
-    parser.add_argument('--mode', choices=['band', 'chern'],
+    parser.add_argument('--mode', choices=['band', 'chern', 'slab'],
                        help='Calculation mode (overrides config file)')
     parser.add_argument('--n_g', type=int,
                        help='Harmonic of G vectors (overrides config file)')
@@ -66,7 +67,8 @@ def main():
     if args.num_processes:
         config.compute.num_processes = args.num_processes
     # Setup logging
-    log_file = Path(config.paths.output_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    os.makedirs(config.paths.output_dir + "/logs", exist_ok=True)
+    log_file = Path(config.paths.output_dir + "/logs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
     logger = setup_logging(str(log_file))
     logger.info("Starting calculation with configuration:")
     logger.info(f"Twist index: {config.twist.twist_index_m}")
@@ -85,7 +87,7 @@ def main():
             spin=config.twist.spin
         )
         structure.display_properties()
-
+        
         # Initialize lattice analyzer
         analyzer = LayeredLatticeAnalyzer(
             input_data=structure.sorted_species_coordinates,
@@ -93,13 +95,16 @@ def main():
             type_structure=config.twist.type_structure,
             twist_layer=config.twist.twist_layer
         )
-        analyzer.process()
+        # analyzer.process()
 
-        # Plot results
-        analyzer.plot_lattice(save=True, save_path=config.paths.output_dir)
-        analyzer.plot_nearest_vectors_phase(save=True, save_path=config.paths.output_dir)
+        if config.compute.TAPW:
+            analyzer.process(TAPW=True)
+            # Plot results
+            os.makedirs(config.paths.output_dir + "/lattice", exist_ok=True)
+            analyzer.plot_lattice(save=True, save_path=config.paths.output_dir + "/lattice")
+            analyzer.plot_nearest_vectors_phase(save=True, save_path=config.paths.output_dir + "/lattice")
 
-        # Process structure
+            # Process structure
         processor = StructureProcessor(
             input_data=analyzer.input_data,
             num_layers=config.twist.num_layers,
@@ -118,11 +123,12 @@ def main():
             Tmat=structure.Tmat,
             reciprocal_Tmat=structure.reciprocal_Tmat,
         )
-        processor.process()
+        if config.compute.TAPW:
+            processor.process()
 
-        # Plot clustering results
-        processor.plot_clusters_loc(save=True, save_path=config.paths.output_dir)
-        processor.plot_clusters_phase(save=True, save_path=config.paths.output_dir)
+            # # Plot clustering results
+            processor.plot_clusters_loc(save=True, save_path=config.paths.output_dir + "/lattice")
+            processor.plot_clusters_phase(save=True, save_path=config.paths.output_dir + "/lattice")
 
         # Handle Hamiltonian
         H_file = config.paths.H_file
@@ -130,14 +136,14 @@ def main():
             H_handler = HrSparseHandler(
                 file_name='',
                 npz_file_name=H_file,
-                A=processor.transformed_index_matrix,
+                A=processor.transformed_index_matrix if config.compute.TAPW else None,
                 read_from_npz=True
             )
         elif H_file.endswith('.dat'):
             H_handler = HrSparseHandler(
                 file_name=H_file,
                 npz_file_name='',
-                A=processor.transformed_index_matrix,
+                A=processor.transformed_index_matrix if config.compute.TAPW else None,
                 read_from_npz=False
             )
         else:
@@ -155,7 +161,7 @@ def main():
                     S_handler = HrSparseHandler(
                         file_name='',
                         npz_file_name=S_file,
-                        A=processor.transformed_index_matrix,
+                        A=processor.transformed_index_matrix if config.compute.TAPW else None,
                         read_from_npz=True
                     )
                     sr = S_handler.get_hr_sparse()
@@ -163,7 +169,7 @@ def main():
                     S_handler = HrSparseHandler(
                         file_name=S_file,
                         npz_file_name='',
-                        A=processor.transformed_index_matrix,
+                        A=processor.transformed_index_matrix if config.compute.TAPW else None,
                         read_from_npz=False
                     )
                     sr = S_handler.get_hr_sparse()
@@ -179,25 +185,43 @@ def main():
         if config.compute.mode == "band":
             kpath_config = KPathGenerator(structure.Tmat)
             kpath_config.read_and_generate_kpath(config.paths.kpath_in, config.paths.kpath_out)
+        elif config.compute.mode == "slab":
+            # For slab mode, k-path is handled internally by TAPWSlab
+            pass
 
         # Calculate for each valley
         for valley in config.compute.valleys:
             logger.info(f"Starting calculation for valley {valley}")
             config.compute.valley = valley
             
-            band_calculator = BandStructureCalculator(
-                hr_supercell=hr,
-                sr_supercell=sr,
-                structure=processor,
-                config=config.compute,
-                kpath_config=kpath_config
-            )
+            # Choose calculator based on mode
+            if config.compute.mode == "slab":
+                
+                calculator = TAPWSlab(
+                    hr_supercell=hr,
+                    sr_supercell=sr,
+                    structure=processor,
+                    config=config,  # Pass full config for slab parameters
+                    kpath_config=kpath_config
+                )
+            else:
+                calculator = BandStructureCalculator(
+                    hr_supercell=hr,
+                    sr_supercell=sr,
+                    structure=processor,
+                    config=config.compute,
+                    kpath_config=kpath_config
+                )
             
             out_path = Path(config.paths.output_dir) / f"Q_shell_{config.compute.n_g}"
             out_path.mkdir(exist_ok=True)
             
-            band_calculator.run_calculation(str(out_path))
-            logger.info(f"Completed calculation for valley {valley}")
+            if config.compute.mode == "slab":
+                calculator.calculate_ribbon_bands(str(out_path))
+                logger.info(f"Completed slab calculation for valley {valley}")
+            else:
+                calculator.run_calculation(str(out_path))
+                logger.info(f"Completed calculation for valley {valley}")
 
     except Exception as e:
         logger.error(f"Error during calculation: {str(e)}", exc_info=True)

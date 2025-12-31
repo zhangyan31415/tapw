@@ -71,16 +71,33 @@ def C3_G_matrix(g_vec_list_K1_1layer,g_vec_list_K1_2layer,m_g_vec,twisted_index_
     C3_2layer = np.zeros((num_gn,num_gn),dtype=np.complex128)
 
     g_vec_1l,g_vec_2l = get_g_vec_perlayer(m_g_vec,twisted_index_m)
-    m_K1 = 1/3*m_g_vec[0] + 1/3*m_g_vec[1]
-    m_K2 = 2/3*m_g_vec[0] - 1/3*m_g_vec[1]
-    m_K3 = 1/3*m_g_vec[0] - 2/3*m_g_vec[1]
-    m_K4 = -m_K1
-    m_K5 = -m_K2
-    m_K6 = -m_K3
+    # m_K1 = 1/3*m_g_vec[0] + 1/3*m_g_vec[1]
+    # m_K2 = 2/3*m_g_vec[0] - 1/3*m_g_vec[1]
+    # m_K3 = 1/3*m_g_vec[0] - 2/3*m_g_vec[1]
+    # m_K4 = -m_K1
+    # m_K5 = -m_K2
+    # m_K6 = -m_K3
     K1_1layer = rot(1/3*g_vec_1l[0]+1/3*g_vec_1l[1],120) #+ m_K1[:2]
     K1_2layer = rot(1/3*g_vec_2l[0]+1/3*g_vec_2l[1],120) #+ m_K1[:2]
     K2_1layer = -rot(1/3*g_vec_1l[0]+1/3*g_vec_1l[1],120) #+ m_K1[:2]
     K2_2layer = -rot(1/3*g_vec_2l[0]+1/3*g_vec_2l[1],120) #+ m_K1[:2]
+    
+    m_g1 = m_g_vec[0][:2]
+    m_g2 = m_g_vec[1][:2]
+    if twisted_index_m % 2 == 1:
+        offset_1 = (twisted_index_m + 1) * (m_g1 + m_g2) / 2
+        offset_2 = rot(offset_1, 120)
+        offset_3 = rot(offset_1, 240)
+        m_M1 = -1/2 * m_g1
+        m_M2 = -1/2 * m_g2
+        m_M3 = rot(m_M2, 120)
+    else:
+        offset_1 = twisted_index_m * (m_g1 + m_g2) / 2
+        offset_2 = rot(offset_1, 120)
+        offset_3 = rot(offset_1, 240)
+        m_M1 = 1/2 * m_g1
+        m_M2 = 1/2 * m_g2
+        m_M3 = rot(m_M2, 120)
 
     if valley == 1:
         K_1layer = K1_1layer

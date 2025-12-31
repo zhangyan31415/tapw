@@ -1,4 +1,4 @@
-# TAPW (Twisted Angle Plane Wave)
+# TAPW (Truncated Atomic Plane Wave)
 
 A Python package for calculating and plotting band structures of twisted materials.
 
@@ -7,8 +7,10 @@ A Python package for calculating and plotting band structures of twisted materia
 - Band structure calculation for twisted bilayer systems
 - Support for various valleys (K1, K2, Gamma, M points)
 - C3 symmetry consideration
+- Slab/ribbon band calculations
 - GPU acceleration support
 - Parallel computation capabilities
+- Orbital analysis and fatband plotting tools
 
 ## Installation
 
@@ -45,9 +47,10 @@ tapw-calc --config config.yaml
 
 3. Plot the band structure:
 ```bash
-cd output_dir/Q_shell_{n_g}/band_data
+cd output_dir/Q_shell_{n_g}/band
 tapw-plot --config ../../bands.yaml
 ```
+If you are using legacy outputs, the data may be under `band_data/` instead of `band/`.
 
 Or with command line arguments:
 
@@ -63,6 +66,19 @@ tapw-calc --config config.yaml --mode chern --n_g 4 --num_processes 100 --num_ch
 tapw-calc --config config.yaml
 cd output_dir/Q_shell_{n_g}
 tapw-chernpost --config config.yaml -b -1,-2 -v 1 > tapw_chern.log
+```
+
+5. Orbital analysis and fatband plotting:
+```bash
+cd output_dir/Q_shell_{n_g}
+tapw-orbital . --config ../config.yaml --valley Gamma --band CBM
+tapw-plot-orbital . --valley Gamma --band CBM --orbital-dir orbital_analysis --output-dir orbital_plots
+```
+
+6. Slab/ribbon calculation:
+```bash
+cd output_dir
+tapw-calc --config config.yaml --mode slab
 ```
 
 

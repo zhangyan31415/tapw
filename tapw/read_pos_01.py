@@ -161,9 +161,9 @@ class OpenMXFile:
         if self.species_coordinates_unit[0].upper() == 'F':
             for i, atom in enumerate(self.species_coordinates):
                 cart_coords = self.frac_to_cart_real(self.Tmat, atom['r'])
-                self.species_coordinates[i]['x'] = cart_coords[0]
-                self.species_coordinates[i]['y'] = cart_coords[1]
-                self.species_coordinates[i]['z'] = cart_coords[2]
+                self.species_coordinates[i]['x'] = float(cart_coords[0])
+                self.species_coordinates[i]['y'] = float(cart_coords[1])
+                self.species_coordinates[i]['z'] = float(cart_coords[2])
         # 删除 'r' 字段
         for i in range(len(self.species_coordinates)):
             self.species_coordinates[i].pop('r', None)
@@ -297,11 +297,11 @@ class OpenMXFile:
         # print("\n=== 原子坐标单位 ===")
         # print(self.species_coordinates_unit)
         # print("\n=== 按 z 轴排序前的前5个原子 ===")
-        # for atom in self.species_coordinates[:5]:
-        #     print(atom)
+        for atom in self.species_coordinates[:5]:
+            print(atom)
         # print("\n=== 按 z 轴排序后的前5个原子 ===")
-        # for atom in self.sorted_species_coordinates[:5]:
-        #     print(atom)
+        for atom in self.sorted_species_coordinates[:5]:
+            print(atom)
         print("\n=== 种类统计 ===")
         print(self.species_count)
         print("\n=== 轨道统计 ===")
@@ -334,13 +334,14 @@ class LayeredLatticeAnalyzer:
         self.layer_all_basis_vectors = {}  # {layer: [a1,a2,a3,...]}
         
 
-    def process(self):
+    def process(self,TAPW=True):
         """
         Runs the processing workflow to derive lattice vectors and reciprocal lattice vectors.
         """
         self.load_data()
-        self.separate_layers()
-        self.compute_lattice_vectors()
+        if TAPW:
+            self.separate_layers()
+            self.compute_lattice_vectors()
 
     def load_data(self):
         """
@@ -491,7 +492,7 @@ class LayeredLatticeAnalyzer:
         for i in range(len(twist_angle_list)):
             print(f"The twist angle between layer {i} and layer {i+1} is {twist_angle_list[i]}°")
         print(f"\n======================= end lattice_vectors computation ========================")
-        
+        # exit()
 
     # useless
     def compute_reciprocal_vectors(self):
@@ -1181,7 +1182,7 @@ class LayeredLatticeAnalyzer:
         top_counts = counts[sorted_indices]
 
         # Check cluster size consistency (within 20%)
-        if np.max(top_counts) / np.min(top_counts) > 1.2:
+        if np.max(top_counts) / np.min(top_counts) > 1.4:
             raise ValueError("Selected clusters have significantly different sizes.")
             # print("Selected clusters have significantly different sizes.")
             # if m != 2:
@@ -1200,22 +1201,33 @@ class LayeredLatticeAnalyzer:
             cluster_avg_angles = []
             for label in top_labels:
                 cluster_angles = angles_mod120[labels == label]
+                #保留5位小数
+                # print(f"cluster_angles = {np.round(cluster_angles*180/np.pi,5)}")
+                if np.max(cluster_angles)-np.min(cluster_angles) > 10/180*np.pi:
+                    shift = -10/180*np.pi
+                    cluster_angles = cluster_angles - shift
+                    cluster_angles = np.mod(cluster_angles, 2*np.pi/3)+shift
+                    # print(f"cluster_angles after shift = {np.round(cluster_angles*180/np.pi,5)}")
+                if np.max(cluster_angles)-np.min(cluster_angles) > 10/180*np.pi:
+                    raise ValueError(f"cluster_angles = {np.round(cluster_angles*180/np.pi,5)}")
                 avg_angle = np.mean(cluster_angles)
+                if avg_angle > np.pi*2/3-1/180*np.pi:
+                    avg_angle = avg_angle - 2*np.pi/3
                 cluster_avg_angles.append(avg_angle)
-            cluster_avg_angles = np.array(cluster_avg_angles)
+            cluster_avg_angles = np.array(cluster_avg_angles)*180/np.pi
+            print(f"cluster_avg_angles = {cluster_avg_angles}")
 
             # Convert average angles to unit vectors for clustering
             radians_avg_angles = np.radians(cluster_avg_angles)
             unit_vectors_avg_angles = np.vstack((np.cos(radians_avg_angles), np.sin(radians_avg_angles))).T
-
-            db_final = DBSCAN(eps=np.radians(tolerance), min_samples=5)
+            db_final = DBSCAN(eps=np.radians(tolerance*0.1), min_samples=1)
             db_final.fit(unit_vectors_avg_angles)
             final_labels = db_final.labels_
 
             # Remove noise
             final_mask = final_labels != -1
             final_unique_labels, final_counts = np.unique(final_labels[final_mask], return_counts=True)
-
+            
             if len(final_unique_labels) not in [1, 2]:
                 raise ValueError(f"After secondary clustering, number of classes ({len(final_unique_labels)}) is not 1 or 2.")
 
@@ -1240,7 +1252,7 @@ class LayeredLatticeAnalyzer:
         # Step 3: Compute average vectors for each selected cluster
         basis_vectors = []
         for label in top_labels:
-            class_id = class_assignments[label]
+            # class_id = class_assignments[label]
             cluster_vectors = vectors[labels == label]
             avg_vector = np.mean(cluster_vectors, axis=0)
             basis_vectors.append(avg_vector)
@@ -1251,12 +1263,26 @@ class LayeredLatticeAnalyzer:
         # theta = 120 if m ==1 else 60
         theta = 60
         rotated_basis_vectors = []
-        for vec in basis_vectors:
-            angle = np.degrees(np.arctan2(vec[1], vec[0])) % theta
+        angles = np.array([np.degrees(np.arctan2(vec[1], vec[0])) for vec in basis_vectors]) % theta
+        print(f"angles = {angles}")
+        if np.max(angles) - np.min(angles) > 10:
+            shift = 10
+            angles = angles - shift
+            angles = np.mod(angles, theta) + shift
+        if np.mean(angles) > 59:
+            angles = angles - 60
+        print(f"angles after shift = {angles}")
+        if np.max(angles) - np.min(angles) > 10:
+            raise ValueError(f"angles = {angles}")
+        
+        for i,vec in enumerate(basis_vectors):
+            # angle = np.degrees(np.arctan2(vec[1], vec[0])) % theta
+            angle = angles[i]
             norm = np.linalg.norm(vec[:2])
             rotated_vec = norm * np.array([np.cos(np.radians(angle)), np.sin(np.radians(angle))])
             rotated_basis_vectors.append(rotated_vec)
         rotated_basis_vectors = np.array(rotated_basis_vectors)
+        print(f"rotated_basis_vectors = {rotated_basis_vectors}")
 
         # Compute final basis vectors by averaging
         # theta = 30 if m ==2 else 0
@@ -1265,7 +1291,7 @@ class LayeredLatticeAnalyzer:
         scale = np.sqrt(3) if self.type_structure[layer] == 1 else 1
         if np.degrees(np.arctan2(rotated_basis_vectors[0,1], rotated_basis_vectors[0,0])) > 30*0.95:
             theta = - theta
-        
+
         final_a1 = np.mean(rotated_basis_vectors, axis=0)
         final_a1 = self.rot_z(final_a1, np.radians(theta))*scale
         final_a2 = self.rot_z(final_a1, np.pi / 3)  # Rotate a1 by 60 degrees
@@ -1274,7 +1300,7 @@ class LayeredLatticeAnalyzer:
         # print("rotated_basis_vectors = ", rotated_basis_vectors)
         # print("theta = ", theta)
         # print(f"Final basis vectors:\na1 = {final_a1}\na2 = {final_a2}")
-
+        # exit()
         return final_a1, final_a2
 
 
@@ -1605,6 +1631,9 @@ class StructureProcessor:
         self.twist_index = twist_index
         self.Tmat = Tmat
         self.reciprocal_Tmat = reciprocal_Tmat
+        
+        self.load_data()
+        print("Data loaded.")
 
     def load_data(self):
         """
@@ -1621,7 +1650,10 @@ class StructureProcessor:
             orb_num = item['orb_num']
             orb_name = item['orb_name']
             global_orb_index = item['orb_global_index']
-            layer_index = item['layer']
+            try:
+                layer_index = item['layer']
+            except:
+                layer_index = 0
             
             
             data.append({'original_index': index, 'species': species, 'x': x, 'y': y, 'z': z, 'orb_num': orb_num, 'orb_name': orb_name, 'orb_global_index': global_orb_index, 'layer': layer_index})
@@ -2063,8 +2095,8 @@ class StructureProcessor:
         Executes the full processing workflow: loading data, separating layers, clustering sublayers,
         clustering atom types, aligning coordinates, and printing essential information.
         """
-        self.load_data()
-        print("Data loaded.")
+        # self.load_data()
+        # print("Data loaded.")
         self.separate_layers()
         print("Layers separated.")
         self.cluster_sublayers()
@@ -2093,7 +2125,7 @@ class StructureProcessor:
             self.phase2[mask] = (self.df.loc[mask, 'x'] * b2[0] + self.df.loc[mask, 'y'] * b2[1]) % self.period
         self.df['phase1'] = self.phase1
         self.df['phase2'] = self.phase2
-        print("Phase data computed.")
+        # print("Phase data computed.")
 
     def print_summary(self):
         """

@@ -53,6 +53,7 @@ class HrSparseHandler:
             f.readline()
             num_nonzero = int(f.readline().strip().split()[0])
             nwann = int(f.readline().strip().split()[0])
+            self.nwann = nwann
             nrpt = int(f.readline().strip().split()[0])
             print("nrpt nwann num_nonzero", nrpt, nwann, num_nonzero)
             print("loading hamr...")
@@ -79,11 +80,15 @@ class HrSparseHandler:
                 hr_sparse_chunk[key]["val"] = np.float64(hr_sparse_chunk[key]["real"]) + 1j * np.float64(hr_sparse_chunk[key]["imag"])
                 # print("A shape",self.A.shape)
                 # print("nwann",nwann)
-                hr_sparse_chunk[key]["hr"] = self.A.dot(
-                    scipy.sparse.csr_matrix((hr_sparse_chunk[key]["val"], (hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"])), shape=(nwann, nwann)).dot(self.A.T)
-                )
-                hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"] = hr_sparse_chunk[key]["hr"].nonzero()
-                hr_sparse_chunk[key]["val"] = hr_sparse_chunk[key]["hr"].data
+                if self.A is not None:
+                    hr_sparse_chunk[key]["hr"] = self.A.dot(
+                        scipy.sparse.csr_matrix((hr_sparse_chunk[key]["val"], (hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"])), shape=(nwann, nwann)).dot(self.A.T)
+                    )
+                    hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"] = hr_sparse_chunk[key]["hr"].nonzero()
+                    hr_sparse_chunk[key]["val"] = hr_sparse_chunk[key]["hr"].data
+                # else:
+                #     hr_sparse_chunk[key]["hr"] = scipy.sparse.csr_matrix((hr_sparse_chunk[key]["val"], (hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"])), shape=(nwann, nwann))
+                
 
 
             new_hr_sparse = {}
@@ -121,7 +126,7 @@ class HrSparseHandler:
             elif attribute == 'col':
                 data[key_tuple]['col'] = loaded_data[key]
             elif attribute == 'val':
-                if 'deeph-pack' in file_path and 'H.npz' in file_path:
+                if ('deeph-pack' in file_path or 'DeepH-pack' in file_path) and 'H.npz' in file_path:
                     data[key_tuple]['val'] = loaded_data[key] * Hartree
                 else:
                     data[key_tuple]['val'] = loaded_data[key]
@@ -143,8 +148,18 @@ class HrSparseHandler:
             elif attribute == 'val':
                 if 'deeph-pack' in file_path and 'H.npz' in file_path:
                     print("loaded data from deeph-pack")
+                    data[key_tuple]['val'] = loaded_data[key]# * Hartree
+                elif 'DeepH-pack' in file_path and 'H.npz' in file_path:
+                    print("loaded data from DeepH-pack")
+                    data[key_tuple]['val'] = loaded_data[key] * Hartree
+                elif 'A.tapw_band_from_lijh' in file_path and 'H.dat' not in file_path:
+                    print("loaded data from A.tapw_band_from_lijh")
+                    data[key_tuple]['val'] = loaded_data[key] * Hartree
+                elif "Z.hr_sr_mat_openmx_recalc_from_relaxed_str" in file_path and 'H.npz' in file_path:
+                    print("loaded data from Z.hr_sr_mat_openmx_recalc_from_relaxed_str")
                     data[key_tuple]['val'] = loaded_data[key] * Hartree
                 else:
+                    print("loaded data from openmx file")
                     data[key_tuple]['val'] = loaded_data[key]
         self.hr_sparse = data
         
@@ -152,11 +167,15 @@ class HrSparseHandler:
         for key in tqdm(hr_sparse_chunk.keys()):
                 nwann = np.unique(hr_sparse_chunk[(0,0,0)]['row']).shape[0]
                 # print("nwann = ",nwann)
-                hr_sparse_chunk[key]["hr"] = self.A.dot(
-                    scipy.sparse.csr_matrix((hr_sparse_chunk[key]["val"], (hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"])), shape=(nwann, nwann)).dot(self.A.T)
-                )
-                hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"] = hr_sparse_chunk[key]["hr"].nonzero()
-                hr_sparse_chunk[key]["val"] = hr_sparse_chunk[key]["hr"].data
+                if self.A is not None:
+                    hr_sparse_chunk[key]["hr"] = self.A.dot(
+                        scipy.sparse.csr_matrix((hr_sparse_chunk[key]["val"], (hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"])), shape=(nwann, nwann)).dot(self.A.T)
+                    )
+                    hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"] = hr_sparse_chunk[key]["hr"].nonzero()
+                    hr_sparse_chunk[key]["val"] = hr_sparse_chunk[key]["hr"].data
+                # else:
+                #     hr_sparse_chunk[key]["hr"] = scipy.sparse.csr_matrix((hr_sparse_chunk[key]["val"], (hr_sparse_chunk[key]["row"], hr_sparse_chunk[key]["col"])), shape=(nwann, nwann))
+                
 
 
         new_hr_sparse = {}
@@ -176,7 +195,7 @@ class HrSparseHandler:
             npz_file_name = self.npz_file_name
         if self.read_from_npz or os.path.exists(self.npz_file_name) or os.path.exists(npz_file_name):
             # self.load_from_npz(npz_file_name)
-            if 'deeph-pack' in self.npz_file_name:
+            if 'deeph-pack' in self.npz_file_name or 'DeepH-pack' in self.npz_file_name or "A.tapw_band_from_lijh" in self.npz_file_name or "Z.hr_sr_mat_openmx_recalc_from_relaxed_str" in self.npz_file_name:
                 self.load_from_npz_new(npz_file_name)
             else:
                 self.load_from_npz(npz_file_name)
