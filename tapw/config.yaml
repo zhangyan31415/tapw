@@ -3,8 +3,8 @@
 # Twist parameters
 twist:
   twist_index_m: 3          # Twist index m, determines the twist angle
+  bravais: "hex"           # Bravais lattice type: "hex", "square", or "rect"
   num_layers: 2             # Total number of layers in the structure
-  type_structure: [2, 2]    # Structure type for each layer: 1 for graphene-like, 2 for TMD-like
   twist_layer: [1, 1]       # Which layers are twisted relative to each other
   spin: true               # Whether to include spin in calculations
 
@@ -30,6 +30,9 @@ compute:
                           # 31: M1 valley
                           # 32: M2 valley
                           # 33: M3 valley
+                          # 3: M (square/rect)
+                          # 41: X (square/rect)
+                          # 42: Y (square/rect)
   
   # Calculation mode
   mode: "band"            # Calculation mode: "band" for band structure, "chern" for Chern number, "slab" for slab/ribbon calculation

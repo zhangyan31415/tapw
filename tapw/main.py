@@ -7,7 +7,7 @@ from pathlib import Path
 import os
 from .config import Config
 from .cal_ham_01 import BandStructureCalculator
-from .read_pos_01 import LayeredLatticeAnalyzer, StructureProcessor,OpenMXFile
+from .read_pos_01 import OpenMXFile, StructureProcessorSpglib
 from .read_kpath_01 import KPathGenerator
 from .read_hr_01 import HrSparseHandler
 from .tapw_slab import TAPWSlab
@@ -88,27 +88,10 @@ def main():
         )
         structure.display_properties()
         
-        # Initialize lattice analyzer
-        analyzer = LayeredLatticeAnalyzer(
+        # Process structure (spglib-based atom typing via basis_id + sublayer)
+        processor = StructureProcessorSpglib(
             input_data=structure.sorted_species_coordinates,
             num_layers=config.twist.num_layers,
-            type_structure=config.twist.type_structure,
-            twist_layer=config.twist.twist_layer
-        )
-        # analyzer.process()
-
-        if config.compute.TAPW:
-            analyzer.process(TAPW=True)
-            # Plot results
-            os.makedirs(config.paths.output_dir + "/lattice", exist_ok=True)
-            analyzer.plot_lattice(save=True, save_path=config.paths.output_dir + "/lattice")
-            analyzer.plot_nearest_vectors_phase(save=True, save_path=config.paths.output_dir + "/lattice")
-
-            # Process structure
-        processor = StructureProcessor(
-            input_data=analyzer.input_data,
-            num_layers=config.twist.num_layers,
-            monolayer_reciprocal_list=analyzer.reciprocal_vectors,
             twist_layer=config.twist.twist_layer,
             layer_eps=config.cluster.layer_eps,
             layer_min_samples=config.cluster.layer_min_samples,
@@ -127,6 +110,7 @@ def main():
             processor.process()
 
             # # Plot clustering results
+            os.makedirs(config.paths.output_dir + "/lattice", exist_ok=True)
             processor.plot_clusters_loc(save=True, save_path=config.paths.output_dir + "/lattice")
             processor.plot_clusters_phase(save=True, save_path=config.paths.output_dir + "/lattice")
 

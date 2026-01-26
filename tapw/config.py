@@ -8,10 +8,16 @@ from pathlib import Path
 class TwistConfig:
     """Configuration for twisted materials"""
     twist_index_m: int
+    bravais: str = "hex"  # Bravais lattice type: "hex", "square", or "rect"
     num_layers: int = 2
     type_structure: List[int] = field(default_factory=lambda: [2, 2])
     twist_layer: List[int] = field(default_factory=lambda: [1, 1])
     spin: bool = True
+
+    def __post_init__(self):
+        allowed = {"hex", "square", "rect"}
+        if self.bravais not in allowed:
+            raise ValueError(f"Invalid bravais lattice type: {self.bravais}. Must be one of {sorted(allowed)}")
 
 @dataclass
 class PathConfig:
@@ -126,9 +132,13 @@ class ComputeConfig:
     def __post_init__(self):
         # Valley mapping
         valley_flag = {
-            1: "K1", 2: "K2", 
-            11: "K1_120", 12: "K1_240", 
+            1: "K1", 2: "K2",
+            11: "K1_120", 12: "K1_240",
+            # Square/rect high-symmetry points
             5: "Gamma",
+            3: "M",
+            41: "X",
+            42: "Y",
             31: "M1", 32: "M2", 33: "M3"
         }
         # Solver mapping
@@ -190,6 +200,8 @@ class Config:
             cluster=cluster_config,
             slab=slab_config
         )
+        # Propagate twist bravais to compute for downstream logic
+        config_obj.compute.bravais = config_obj.twist.bravais
         # 如果config.yaml没有n_g字段，则自动调用update_ng
         if 'n_g' not in config_dict.get('compute', {}):
             config_obj.update_ng()

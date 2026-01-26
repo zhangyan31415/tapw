@@ -247,6 +247,7 @@ def main():
     parser.add_argument('-wd', '--wcc-direction', type=str, default='ky', choices=['kx', 'ky'], help='Wilson loop direction (default: ky)')
     parser.add_argument('-o', '--output-dir', type=str, default='./', help='Output directory (default: config.yaml output_dir)')
     parser.add_argument('-v', '--valley', type=int, default=1, help='Valley number (1:K1, 2:K2, 5:Gamma, 11:K1_120, 12:K1_240, 31:M1, 32:M2, 33:M3)')
+    parser.add_argument('-bt', '--band-type', type=str, default='VBM', help='Band type (default: VBM)')
     args = parser.parse_args()
 
     if not args.band and not args.wcc_bands:
@@ -261,7 +262,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     num_chern = config['compute']['num_chern']
     # 获取band_type信息
-    band_type = config['compute'].get('band_type', 'VBM')
+    band_type = args.band_type if args.band_type else config['compute'].get('band_type', 'VBM')
     # 自动定位 openmx.dat 路径
     input_file = config['paths'].get('input_file', 'openmx.dat')
     openmx_path = input_file if os.path.isabs(input_file) else os.path.join(config['paths']['output_dir'], input_file)

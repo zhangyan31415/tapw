@@ -15,7 +15,7 @@ from joblib import Parallel, delayed
 from .C3_symm_01 import C3_MoTe2_all, C3_G_matrix
 from tqdm import tqdm
 from .config import ComputeConfig
-from .read_pos_01 import StructureProcessor
+from .read_pos_01 import StructureProcessorSpglib
 from .read_kpath_01 import KPathGenerator
 from .utils import (
     timing_decorator_factory, rotate_vector, unique_sorted, 
@@ -35,7 +35,7 @@ except ImportError:
 class TAPW_parameters:
     """TAPW parameters for twisted material calculations"""
     
-    def __init__(self, structure: StructureProcessor, config: ComputeConfig):
+    def __init__(self, structure: StructureProcessorSpglib, config: ComputeConfig):
         self.config = config
         self.n_g = self.config.n_g
         self.valley = self.config.valley
@@ -115,7 +115,7 @@ class TAPW_parameters:
         """Calculate the K1 and K2 points."""
         m_g_unitvec_1 = self.structure.reciprocal_Tmat[0][:2]
         m_g_unitvec_2 = self.structure.reciprocal_Tmat[1][:2]
-        if self.structure.reciprocal_Tmat[0] @ self.structure.reciprocal_Tmat[1] < 0:
+        if self.structure.reciprocal_Tmat[0] @ self.structure.reciprocal_Tmat[1] < -0.01:
             m_g_unitvec_1 = -self.structure.reciprocal_Tmat[0][:2]
         else:
             m_g_unitvec_1 = self.structure.reciprocal_Tmat[0][:2]
@@ -139,9 +139,81 @@ class TAPW_parameters:
             m_K1 = K1 - offset
             m_K2 = K2 - offset
             return K1, K2, m_K1, m_K2, offset
-        
-        
-        
+
+        bravais = getattr(self.config, "bravais", "hex")
+        if bravais in {"square", "rect"}:
+            # Use the moiré reciprocal basis (2D) to define Γ/X/Y/M in the moiré BZ
+            g1 = m_g_unitvec_1
+            g2 = m_g_unitvec_2
+
+            # Moiré high-symmetry k-points (mBZ coordinates)
+            m_Gamma = np.zeros(2)
+            # m_X = 0.5 * g1
+            # m_Y = 0.5 * g2
+            # m_M = 0.5 * (g1 + g2)
+            if n_moire%2 == 1:
+                offset_X = 0.5 * (n_moire+1) * (g1 + g2)
+                m_X1 = -0.5 * g2
+                m_X2 = -0.5 * g1
+            else:
+                offset_X = 0.5 * n_moire * (g1 + g2)
+                m_X1 = 0.5 * g1
+                m_X2 = 0.5 * g2
+            m_M1 = 0.5 * (g1 - g2)
+            m_M2 = 0.5 * (g1 + g2)
+            
+            # Valley-dependent reciprocal-space offsets (commensurate indexing)
+            offset_Gamma = np.zeros(2)
+            # offset_X = n_moire * g1
+            # offset_Y = n_moire * g2
+            # offset_M = n_moire * (g1 + g2)
+            
+            # offset_X = 0.5 * n_moire * (g1 + g2)
+            # offset_Y = 0.5 * n_moire * (-g1 + g2)
+            offset_M = n_moire * g1
+            
+                
+            print("g1 = ",g1)
+            print("g2 = ",g2)
+            print("n_moire = ",n_moire)
+            print("offset_X = ",offset_X)
+            # print("offset_Y = ",offset_Y)
+            print("offset_M = ",offset_M)
+
+            # For square/rect: valley_dict returns (K1, K2) centers used downstream;
+            # mK_dict stores the moiré k-point (e.g. X = 1/2*g1).
+            valley_dict = {
+                5: (m_Gamma + offset_Gamma, m_Gamma + offset_Gamma),  # Γ
+                41: (m_X1 + offset_X, m_X1 + offset_X),                  # X
+                42: (rotate_vector(m_X1 + offset_X,90), rotate_vector(m_X2 + offset_X,90)),  # Y
+                3: (m_M1 + offset_M, m_M2 + offset_M),                   # M
+            }
+
+            offset_dict = {
+                5: offset_Gamma,
+                41: offset_X,
+                42: rotate_vector(offset_X,90),
+                3: offset_M,
+            }
+
+            mK_dict = {
+                5: (m_Gamma, m_Gamma),
+                41: (m_X1, m_X2),
+                42: (rotate_vector(m_X1,90), rotate_vector(m_X2,90)),
+                3: (m_M1, m_M2),
+            }
+
+            if self.valley not in valley_dict:
+                raise ValueError(
+                    f"For bravais='{bravais}', supported valleys are {sorted(valley_dict.keys())}. Got {self.valley}"
+                )
+
+            K1, K2 = valley_dict[self.valley]
+            m_K1, m_K2 = mK_dict[self.valley]
+            offset = offset_dict[self.valley]
+            print("K1, K2, m_K1, m_K2, offset = ", K1, K2, m_K1, m_K2, offset)
+            return K1, K2, m_K1, m_K2, offset
+
         print("m_g_unitvec_1 = ", m_g_unitvec_1)
         print("m_g_unitvec_2 = ", m_g_unitvec_2)
         offset = -n_moire * m_g_unitvec_1 + n_moire * m_g_unitvec_2
@@ -238,7 +310,7 @@ class TAPW_parameters:
 
         g_vec_list_K1 = []
         g_vec_list_K2 = []
-        n_g = self.n_g - 1 if self.valley == 5 else self.n_g
+        n_g = self.n_g - 0 if self.valley == 5 else self.n_g
         
         for i, vec in enumerate(o_g_vec_list_m_K1):
             if np.linalg.norm(vec) < K1_distance[n_g - 1] + 0.001:
@@ -584,7 +656,7 @@ class TAPW_parameters:
         """Generate all TAPW parameters"""
         self.generate_g_vec_list()
         self.generate_gr_matrix()
-        self.generate_C3_matrix()
+        # self.generate_C3_matrix()
         if self.config.C3_H:
             self.generate_C3_matrix()
             self.generate_g_symm_matrix()
@@ -597,10 +669,11 @@ class BandStructureCalculator:
     # Valley mapping
     VALLEY_MAP = {
         1: "K1", 2: "K2", 11: "K1_120", 12: "K1_240", 5: "Gamma",
-        31: "M1", 32: "M2", 33: "M3"
+        31: "M1", 32: "M2", 33: "M3",
+        3: "M", 41: "X", 42: "Y"
     }
 
-    def __init__(self, hr_supercell, sr_supercell, structure: StructureProcessor, config: ComputeConfig, kpath_config: KPathGenerator=None):
+    def __init__(self, hr_supercell, sr_supercell, structure: StructureProcessorSpglib, config: ComputeConfig, kpath_config: KPathGenerator=None):
         """Initialize the calculator
         
         Args:
