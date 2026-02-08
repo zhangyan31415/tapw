@@ -14,20 +14,20 @@ fermi_energy: -4.6  # 设置费米能级
 fermi_line: true   # 是否画费米能级线
 
 bands:
-  - file: "band_K1_VBM_valley.txt"
+  - file: "band_VBM_K1_valley.txt"
     label: "K1 Valley"
     color: "#DE6E66"
     plot_type: "line"     # 可选：单独设置这条band的绘图类型
     linestyle: "-"
     linewidth: 1.5
     
-  - file: "band_K2_VBM_valley.txt"
+  - file: "band_VBM_K2_valley.txt"
     label: "K2 Valley"
     color: "dodgerblue"
     plot_type: "scatter"  # 这条用散点图
     marker_size: 1
     marker: "o"
     
-  - file: "band_Gamma_VBM_valley.txt"
+  - file: "band_VBM_Gamma_valley.txt"
     label: "Gamma Valley"
     color: "g"

@@ -395,8 +395,8 @@ class OpenMXFile:
         """
         print("=== Bravais (moiré supercell) ===")
         print(self.bravais)
-        print("=== 扭转角度 ===")
-        print(self.twist_angle)
+        print("=== 扭转角度 (理论值，基于 twist_index_m) ===")
+        print(f"{self.twist_angle:.6f}°")
         # print("\n=== 单位晶胞数量 ===")
         # print(self.num_unit_cell)
         print("\n=== 单位向量 (Angstrom) ===")
@@ -423,12 +423,12 @@ class OpenMXFile:
         print(self.atoms_number)
         print("\n=== 原子坐标单位 ===")
         print(self.species_coordinates_unit)
-        print("\n=== 按 z 轴排序前的前5个原子 ===")
-        for atom in self.species_coordinates[:5]:
-            print(atom)
-        print("\n=== 按 z 轴排序后的前5个原子 ===")
-        for atom in self.sorted_species_coordinates[:5]:
-            print(atom)
+        # print("\n=== 按 z 轴排序前的前5个原子 ===")
+        # for atom in self.species_coordinates[:5]:
+        #     print(atom)
+        # print("\n=== 按 z 轴排序后的前5个原子 ===")
+        # for atom in self.sorted_species_coordinates[:5]:
+        #     print(atom)
         print("\n=== 种类统计 ===")
         print(self.species_count)
         print("\n=== 轨道统计 ===")
@@ -2010,7 +2010,8 @@ class LayeredLatticeAnalyzerSpglib:
             
             # Call spglib to find primitive cell
             cellS = (latS, posS_frac, numS)
-            print(cellS)
+            # Print summary only (not full cellS with all atom positions)
+            print(f"[Spglib] Layer {layer}: {len(numS)} atoms, lattice shape {latS.shape}, positions shape {posS_frac.shape}")
             prim = spglib.standardize_cell(
                 cellS, 
                 to_primitive=True, 
@@ -2956,61 +2957,95 @@ class StructureProcessorSpglib:
 
     def separate_layers(self):
         """
-        Separates atoms into the specified number of layers based on their z-coordinate using K-Means clustering.
-
+        Separates atoms into physical layers (phys_layer) and assigns twist groups (twist_group).
+        
+        Physical layers (phys_layer): 0..N-1, ordered from bottom to top by z-coordinate.
+        Twist groups (twist_group): 0..G-1, where G = len(twist_layer_counts).
+        Each twist_group contains twist_layer_counts[gid] physical layers.
+        
         Adds:
-            'layer' column to self.df.
+            'phys_layer': Physical layer index (0..N-1)
+            'twist_group': Twist group index (0..G-1)
+            'layer': Alias for phys_layer (for backward compatibility)
         """
-        def assign_twist_groups(layer_indices, twist_layer):
-            """
-            layer_indices: 已经按z均值排序后的层编号（如[0,1,2,3]）
-            twist_layer: 例如[1,2,1]
-            返回：每个层编号对应的组号
-            """
-            group_labels = []
-            current = 0
-            for group, count in enumerate(twist_layer):
-                for _ in range(count):
-                    group_labels.append(group)
-                    current += 1
-            return {layer: group_labels[i] for i, layer in enumerate(layer_indices)}
-
         if self.df is None:
             raise ValueError("DataFrame is empty. Please load data first.")
-
+        
+        # Validate twist_layer_counts
+        twist_layer_counts = self.twist_layer
+        if sum(twist_layer_counts) != self.num_layers:
+            raise ValueError(
+                f"sum(twist_layer_counts)={sum(twist_layer_counts)} != num_layers={self.num_layers}. "
+                f"twist_layer_counts={twist_layer_counts} must sum to num_layers."
+            )
+        
         # Extract z coordinates and reshape for clustering
         z_coords = self.df['z'].values.reshape(-1, 1)
-
-        # Initialize K-Means with the desired number of clusters (layers)
+        
+        # Initialize K-Means with the desired number of clusters (physical layers)
         kmeans = KMeans(n_clusters=self.num_layers, random_state=0, n_init='auto')
-
+        
         # Fit K-Means and predict cluster labels
         labels = kmeans.fit_predict(z_coords)
-
-        # Assign cluster labels to the DataFrame
-        self.df['layer'] = labels
-
+        self.df['phys_layer'] = labels
+        
         # Calculate the mean z-coordinate for each layer to sort layers from bottom to top
-        layer_means = self.df.groupby('layer')['z'].mean().sort_values().index.tolist()
-
+        layer_means = self.df.groupby('phys_layer')['z'].mean().sort_values().index.tolist()
+        
         # Create a mapping from old labels to new labels sorted by mean z-coordinate
         label_mapping = {old_label: new_label for new_label, old_label in enumerate(layer_means)}
-
+        
         # Apply the mapping to ensure layers are ordered from bottom to top
-        self.df['layer'] = self.df['layer'].map(label_mapping)
-
-        # Map layers into twist groups
-        group_mapping = assign_twist_groups(sorted(label_mapping.values()), self.twist_layer)
-        self.df['layer'] = self.df['layer'].map(group_mapping)
-
-        # Propagate layer labels to input_data for downstream compatibility
+        self.df['phys_layer'] = self.df['phys_layer'].map(label_mapping)
+        
+        # Validate phys_layer covers 0..N-1
+        unique_phys_layers = sorted(self.df['phys_layer'].unique())
+        if unique_phys_layers != list(range(self.num_layers)):
+            raise ValueError(
+                f"phys_layer must cover 0..{self.num_layers-1}, got {unique_phys_layers}"
+            )
+        
+        # Assign twist groups based on twist_layer_counts
+        # group0 covers phys_layer 0..(count0-1)
+        # group1 covers phys_layer count0..(count0+count1-1)
+        # etc.
+        self.df['twist_group'] = -1
+        phys_layer_to_group = {}
+        phys_layer_idx = 0
+        for group_id, count in enumerate(twist_layer_counts):
+            for _ in range(count):
+                phys_layer_to_group[phys_layer_idx] = group_id
+                phys_layer_idx += 1
+        
+        self.df['twist_group'] = self.df['phys_layer'].map(phys_layer_to_group)
+        
+        # Validate twist_group covers 0..G-1
+        n_groups = len(twist_layer_counts)
+        unique_groups = sorted(self.df['twist_group'].unique())
+        if unique_groups != list(range(n_groups)):
+            raise ValueError(
+                f"twist_group must cover 0..{n_groups-1}, got {unique_groups}"
+            )
+        
+        # Set 'layer' = 'phys_layer' for backward compatibility
+        self.df['layer'] = self.df['phys_layer']
+        
+        # Propagate labels to input_data for downstream compatibility
         for i, _item in enumerate(self.input_data):
-            self.input_data[i]['layer'] = self.df.loc[i, 'layer']
-
-        print(f"Separated into {len(self.twist_layer)} layers with {self.df.shape[0]} atoms.")
-        for i in range(len(self.twist_layer)):
-            num_atoms = self.df[self.df['layer'] == i].shape[0]
-            print(f"Layer {i}: {num_atoms} atoms.")
+            self.input_data[i]['phys_layer'] = int(self.df.loc[i, 'phys_layer'])
+            self.input_data[i]['twist_group'] = int(self.df.loc[i, 'twist_group'])
+            self.input_data[i]['layer'] = int(self.df.loc[i, 'layer'])  # = phys_layer
+        
+        # Print summary
+        print(f"Separated into {self.num_layers} physical layers and {n_groups} twist groups with {self.df.shape[0]} atoms.")
+        print(f"twist_layer_counts = {twist_layer_counts}")
+        for phys_layer in range(self.num_layers):
+            num_atoms = len(self.df[self.df['phys_layer'] == phys_layer])
+            group_id = phys_layer_to_group[phys_layer]
+            print(f"  phys_layer={phys_layer} (twist_group={group_id}): {num_atoms} atoms")
+        for group_id in range(n_groups):
+            num_atoms = len(self.df[self.df['twist_group'] == group_id])
+            print(f"  twist_group={group_id}: {num_atoms} atoms")
 
     def cluster_sublayers(self):
         """
@@ -3035,12 +3070,18 @@ class StructureProcessorSpglib:
     def compute_phase(self):
         """
         Computes phase1 and phase2 based on reciprocal lattice vectors and atom positions.
+        
+        Uses twist_group's reciprocal vectors (shared by all physical layers in the group),
+        but computes phase for each physical layer separately.
         """
         self.phase1 = np.zeros(self.df.shape[0])
         self.phase2 = np.zeros(self.df.shape[0])
-        for i in range(len(self.twist_layer)):
-            b1, b2 = self.monolayer_reciprocal_list[i]
-            mask = self.df['layer'] == i
+        n_groups = len(self.twist_layer)
+        for twist_group in range(n_groups):
+            # Get reciprocal vectors for this twist_group (shared by all phys_layers in the group)
+            b1, b2 = self.monolayer_reciprocal_list[twist_group]
+            # Compute phase for all atoms in this twist_group (all physical layers)
+            mask = self.df['twist_group'] == twist_group
             self.phase1[mask] = (self.df.loc[mask, 'x'] * b1[0] + self.df.loc[mask, 'y'] * b1[1]) % self.period
             self.phase2[mask] = (self.df.loc[mask, 'x'] * b2[0] + self.df.loc[mask, 'y'] * b2[1]) % self.period
         self.df['phase1'] = self.phase1
@@ -3069,8 +3110,9 @@ class StructureProcessorSpglib:
             if mask.sum() == 0:
                 continue
 
-            layer_index = self.df.loc[mask, 'layer'].values[0]
-            b1, b2 = self.monolayer_reciprocal_list[layer_index]
+            # Use twist_group to get reciprocal vectors (shared by all phys_layers in the group)
+            twist_group = self.df.loc[mask, 'twist_group'].values[0]
+            b1, b2 = self.monolayer_reciprocal_list[twist_group]
             A = np.array([b1, b2])  # Shape: (2, 2)
             try:
                 A_inv = np.linalg.inv(A)
@@ -3207,7 +3249,8 @@ class StructureProcessorSpglib:
         phase2_deg = (self.df.phase2.values * 180 / np.pi) % 360
         period_deg = (self.period * 180 / np.pi) % 360
 
-        fig, ax = plt.subplots(1, len(self.twist_layer), figsize=(15, 4))
+        # Phase plots should always have 2 subplots (b1 and b2), not based on twist_group count
+        fig, ax = plt.subplots(1, 2, figsize=(15, 4))
         unique_labels = sorted(self.df['atom_type'].unique())
         colors = plt.get_cmap('tab10', len(unique_labels))
 
@@ -3307,7 +3350,16 @@ class StructureProcessorSpglib:
             raise ValueError(f"Unknown chemical symbols for spglib/ase mapping: {sorted(unknown)}")
         return np.asarray(nums, dtype=int)
 
-    def _compute_layer_lattice_and_basis_spglib(self, layer: int):
+    def _compute_layer_lattice_and_basis_spglib(self, twist_group: int):
+        """
+        Compute lattice vectors and basis_id for a twist_group using spglib.
+        
+        All physical layers in the same twist_group share the same lattice vectors.
+        This method aggregates all atoms from all physical layers in the given twist_group.
+        
+        Args:
+            twist_group: Twist group index (0..G-1)
+        """
         try:
             import spglib
         except Exception as exc:
@@ -3316,9 +3368,10 @@ class StructureProcessorSpglib:
         if self.Tmat is None:
             raise ValueError("Tmat is required for spglib processing (moiré supercell lattice).")
 
-        layer_df = self.df[self.df["layer"] == layer]
-        if layer_df.empty:
-            raise ValueError(f"Layer {layer}: no atoms found.")
+        # Aggregate all atoms from all physical layers in this twist_group
+        group_df = self.df[self.df["twist_group"] == twist_group]
+        if group_df.empty:
+            raise ValueError(f"Twist group {twist_group}: no atoms found.")
 
         latS = np.asarray(self.Tmat, dtype=np.float64).copy()
         if latS.shape != (3, 3):
@@ -3327,23 +3380,24 @@ class StructureProcessorSpglib:
         # Enforce a large out-of-plane lattice constant for quasi-2D materials.
         latS[2, 2] = max(self.spglib_z_lattice, float(latS[2, 2]))
 
-        pos_cart = layer_df[["x", "y", "z"]].values.astype(np.float64, copy=False)
+        pos_cart = group_df[["x", "y", "z"]].values.astype(np.float64, copy=False)
         pos_frac = np.linalg.solve(latS.T, pos_cart.T).T  # no wrap on purpose
-        numS = self._species_to_atomic_numbers(layer_df["species"].values)
+        numS = self._species_to_atomic_numbers(group_df["species"].values)
 
         cellS = (latS, pos_frac, numS)
-        print(cellS)
+        # Print summary only (not full cellS with all atom positions)
+        print(f"[Spglib] Twist group {twist_group}: {len(numS)} atoms, lattice shape {latS.shape}, positions shape {pos_frac.shape}")
         dataset = spglib.get_symmetry_dataset(cellS, symprec=self.symprec)
         if dataset is None:
             raise RuntimeError(
-                f"Layer {layer}: spglib.get_symmetry_dataset failed with symprec={self.symprec}. "
+                f"Twist group {twist_group}: spglib.get_symmetry_dataset failed with symprec={self.symprec}. "
                 f"Try adjusting symprec."
             )
 
         mapping = self._get_mapping_to_primitive(dataset)
         if mapping.shape[0] != numS.shape[0]:
             raise RuntimeError(
-                f"Layer {layer}: mapping_to_primitive length mismatch "
+                f"Twist group {twist_group}: mapping_to_primitive length mismatch "
                 f"({mapping.shape[0]} vs {numS.shape[0]})."
             )
 
@@ -3351,14 +3405,14 @@ class StructureProcessorSpglib:
         for basis_id in np.unique(mapping):
             zs = np.unique(numS[mapping == basis_id])
             if zs.size != 1:
-                bad_species = [layer_df["species"].values[i] for i in np.where(mapping == basis_id)[0]]
+                bad_species = [group_df["species"].values[i] for i in np.where(mapping == basis_id)[0]]
                 raise ValueError(
-                    f"Layer {layer}: basis_id={basis_id} maps to multiple species {zs.tolist()} "
+                    f"Twist group {twist_group}: basis_id={basis_id} maps to multiple species {zs.tolist()} "
                     f"({sorted(set(map(str, bad_species)))}) — try smaller symprec."
                 )
 
         # Write back using original indices to avoid accidental reordering bugs.
-        idx = layer_df.index.to_numpy()
+        idx = group_df.index.to_numpy()
         if "basis_id" not in self.df.columns:
             self.df["basis_id"] = -1
         self.df.loc[idx, "basis_id"] = mapping
@@ -3373,28 +3427,38 @@ class StructureProcessorSpglib:
                     break
         if prim is None:
             raise RuntimeError(
-                f"Layer {layer}: spglib.standardize_cell(to_primitive=True) failed. "
+                f"Twist group {twist_group}: spglib.standardize_cell(to_primitive=True) failed. "
                 f"Try adjusting symprec (current {self.symprec})."
             )
 
         latP, _, _ = prim
         a1 = np.asarray(latP[0, :2], dtype=np.float64)
         a2 = np.asarray(latP[1, :2], dtype=np.float64)
-        self.layer_lattice_vectors[layer] = [a1, a2]
-        print(f"Layer {layer}: lattice vectors (Angstrom) =====")
+        
+        # Store lattice vectors for this twist_group (shared by all physical layers in the group)
+        self.layer_lattice_vectors[twist_group] = [a1, a2]
+        print(f"[Spglib] Twist group {twist_group}: lattice vectors (Angstrom) =====")
         print(np.array([a1, a2]))
 
         area = float(a1[0] * a2[1] - a1[1] * a2[0])
         if area == 0.0:
-            raise ValueError(f"Layer {layer}: lattice vectors are collinear; cannot compute reciprocal vectors.")
+            raise ValueError(f"Twist group {twist_group}: lattice vectors are collinear; cannot compute reciprocal vectors.")
         b1 = (2 * np.pi / area) * np.array([a2[1], -a2[0]], dtype=np.float64)
         b2 = (2 * np.pi / area) * np.array([-a1[1], a1[0]], dtype=np.float64)
-        self.monolayer_reciprocal_list[layer] = [b1, b2]
+        
+        # Store reciprocal vectors for this twist_group (shared by all physical layers in the group)
+        self.monolayer_reciprocal_list[twist_group] = [b1, b2]
 
-        print(f"\n[Spglib] ======= Layer {layer}: lattice vectors (Angstrom) =====")
+        print(f"\n[Spglib] ======= Twist group {twist_group}: lattice vectors (Angstrom) =====")
         print(np.array([a1, a2]))
-        print(f"[Spglib] ======= Layer {layer}: reciprocal vectors (1/Angstrom) =====")
+        print(f"[Spglib] ======= Twist group {twist_group}: reciprocal vectors (1/Angstrom) =====")
         print(np.array([b1, b2]))
+        
+        # Also store for each physical layer in this group (for backward compatibility)
+        phys_layers_in_group = sorted(group_df['phys_layer'].unique())
+        for phys_layer in phys_layers_in_group:
+            self.layer_lattice_vectors[phys_layer] = [a1, a2]
+            self.monolayer_reciprocal_list[phys_layer] = [b1, b2]
 
     def _assign_atom_types_from_basis(self):
         if "basis_id" not in self.df.columns:
@@ -3413,8 +3477,8 @@ class StructureProcessorSpglib:
             if len(species) != 1:
                 raise ValueError(f"atom_type {at} corresponds to multiple species: {species}")
 
-        # Match legacy behaviour: sort by layer/sublayer/atom_type.
-        self.df = self.df.sort_values(by=["layer", "sublayer", "atom_type"]).reset_index(drop=True)
+        # Match legacy behaviour: sort by phys_layer/sublayer/atom_type (layer=phys_layer for compatibility)
+        self.df = self.df.sort_values(by=["phys_layer", "sublayer", "atom_type"]).reset_index(drop=True)
 
     def process(self):
         """
@@ -3425,9 +3489,30 @@ class StructureProcessorSpglib:
         self.cluster_sublayers()
         print("Sublayers clustered.")
 
-        # spglib: per-(twist)layer lattice + basis_id mapping
-        for layer in range(len(self.twist_layer)):
-            self._compute_layer_lattice_and_basis_spglib(layer)
+        # spglib: per-twist_group lattice + basis_id mapping
+        # All physical layers in the same twist_group share the same lattice vectors
+        n_groups = len(self.twist_layer)
+        for twist_group in range(n_groups):
+            self._compute_layer_lattice_and_basis_spglib(twist_group)
+        
+        # Calculate and print twist angles between twist_groups
+        if n_groups >= 2:
+            twist_angle_list = []
+            for twist_group in range(n_groups):
+                a1, a2 = self.layer_lattice_vectors[twist_group]
+                # Use a1 direction as the orientation angle
+                angle = np.degrees(np.arctan2(a1[1], a1[0]))
+                twist_angle_list.append(angle)
+            
+            # Calculate relative twist angles between adjacent groups
+            twist_angle_diffs = np.diff(twist_angle_list)
+            # Normalize to [-180, 180] range
+            twist_angle_diffs = np.mod(twist_angle_diffs + 180, 360) - 180
+            
+            print("\n[Spglib] ======================= Twist angles between groups ========================")
+            for i in range(len(twist_angle_diffs)):
+                print(f"[Spglib] Twist angle between group {i} and group {i+1}: {twist_angle_diffs[i]:.4f}°")
+            print(f"[Spglib] ======================= End twist angle calculation ========================\n")
 
         self._assign_atom_types_from_basis()
         print("Atom types assigned (layer, sublayer, basis_id).")

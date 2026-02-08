@@ -333,16 +333,40 @@ class TAPW_parameters:
 
     @timing_decorator_factory(process_id=0)
     def generate_gr_matrix(self):
-        """Generate the g_matrix for TAPW"""
-        # g_vec_list = np.array([self.g_vec_list_K1, self.g_vec_list_K2])
-        print("layer (unique) = ", self.structure.df['layer'].unique())
-        num_layer = len(self.structure.df['layer'].unique())
+        """Generate the g_matrix for TAPW using twist_group assignment"""
+        # Check that structure has twist_group column
+        if 'twist_group' not in self.structure.df.columns:
+            raise ValueError(
+                "structure.df must contain 'twist_group' column. "
+                "Please use StructureProcessorSpglib with the new multi-group support."
+            )
+        if 'phys_layer' not in self.structure.df.columns:
+            raise ValueError(
+                "structure.df must contain 'phys_layer' column. "
+                "Please use StructureProcessorSpglib with the new multi-group support."
+            )
+        
+        # Get unique twist groups (sorted)
+        unique_groups = sorted(self.structure.df['twist_group'].unique())
+        n_groups = len(unique_groups)
+        
+        # Validate twist_group is continuous 0..n_groups-1
+        if unique_groups != list(range(n_groups)):
+            raise ValueError(
+                f"twist_group must be continuous 0..{n_groups-1}, got {unique_groups}"
+            )
+        
+        # Assign g_vec_list: even groups -> K1, odd groups -> K2
         g_vec_list = []
-        for i in range(num_layer):
-            if i%2 == 0:
+        for group_id in range(n_groups):
+            if group_id % 2 == 0:
                 g_vec_list.append(self.g_vec_list_K1)
+                print(f"twist_group={group_id} -> K1 (g_vec_list length={len(self.g_vec_list_K1)})")
             else:
                 g_vec_list.append(self.g_vec_list_K2)
+                print(f"twist_group={group_id} -> K2 (g_vec_list length={len(self.g_vec_list_K2)})")
+        
+        print(f"Total twist groups: {n_groups}")
         self.g_matrix = self.generate_gr_matrix_cpu(self.structure.df, g_vec_list, spin=self.structure.spin)
         self.g_matrix_conj = self.g_matrix.T.conj()
         
@@ -358,58 +382,73 @@ class TAPW_parameters:
     @staticmethod
     def generate_gr_matrix_cpu(structure_df, g_vec_list, spin=None):
         """
-        生成并返回转换后的 gr_matrix 及其共轭转置 gr_matrix_conj。
+        Generate gr_matrix using twist_group assignment (generalized for n_groups >= 2).
         
-        参数:
-        - structure_df (pd.DataFrame): 包含结构信息的 DataFrame, 必须包含以下列:
-            - 'atom_type': 原子类型
-            - 'orb_num': 每个原子的轨道数量
-            - 'layer': 每个原子的层级索引
-            - 'shifted_x', 'shifted_y': 原子的平移坐标
-        - g_vec_list (np.ndarray): 一个二维数组，形状为 (num_layers, num_g_per_layer, dim)，代表每层的 g 向量列表
+        Parameters:
+        - structure_df (pd.DataFrame): Must contain:
+            - 'atom_type': Atom type
+            - 'orb_num': Number of orbitals per atom
+            - 'twist_group': Twist group index (0..n_groups-1)
+            - 'shifted_x', 'shifted_y': Atom coordinates
+        - g_vec_list (list): List of g-vector arrays, one per twist_group
+            g_vec_list[i] corresponds to twist_group=i
+        - spin: Whether to include spin (block diagonal)
         
-        返回:
-        - gr_matrix (np.ndarray): 生成的 gr_matrix, 形状为 (dim_gr_1, dim_gr_2)
-        - gr_matrix_conj (np.ndarray): gr_matrix 的共轭转置，形状为 (dim_gr_2, dim_gr_1)
+        Returns:
+        - gr_matrix (np.ndarray): Shape (dim_gr_1, dim_gr_2)
         """
+        # Check required columns
+        required_cols = ['atom_type', 'orb_num', 'twist_group', 'shifted_x', 'shifted_y']
+        for col in required_cols:
+            if col not in structure_df.columns:
+                raise ValueError(f"structure_df must contain '{col}' column")
         
-        # 复制 DataFrame 以避免修改原始数据
+        # Copy DataFrame to avoid modifying original
         df_temp = structure_df.copy()
         
-        # 获取唯一的原子类型
+        # Get unique twist groups and validate
+        unique_groups = sorted(df_temp['twist_group'].unique())
+        n_groups = len(unique_groups)
+        if unique_groups != list(range(n_groups)):
+            raise ValueError(f"twist_group must be continuous 0..{n_groups-1}, got {unique_groups}")
+        
+        if len(g_vec_list) != n_groups:
+            raise ValueError(f"g_vec_list length ({len(g_vec_list)}) != n_groups ({n_groups})")
+        
+        # Get unique atom types
         atom_type_list = np.unique(df_temp['atom_type'].values)
         
-        # 获取每种原子的轨道数量（假设每种原子的轨道数量相同）
+        # Get orbital numbers per atom type
         atom_orb_num_list = np.array([
             np.unique(df_temp[df_temp['atom_type'] == atom_type]['orb_num'].values)[0]
             for atom_type in atom_type_list
         ])
         
-        # 获取所有原子的轨道数量列表
+        # Get orbital numbers for all atoms
         atom_orb_num_list_all_atom = np.concatenate([
             df_temp[df_temp['atom_type'] == atom_type]['orb_num'].values
             for atom_type in atom_type_list
         ]).flatten()
         
-        # 获取每种原子的数量
+        # Get atom counts per type
         atom_num_list = np.array([
             len(df_temp[df_temp['atom_type'] == atom_type])
             for atom_type in atom_type_list
         ])
         
-        # 获取每种原子的层级索引（假设每种原子的层级相同）
-        atom_layer_list = np.array([
-            np.unique(df_temp[df_temp['atom_type'] == atom_type]['layer'].values)[0]
+        # Get twist_group per atom type (assume all atoms of same type have same group)
+        atom_twist_group_list = np.array([
+            np.unique(df_temp[df_temp['atom_type'] == atom_type]['twist_group'].values)[0]
             for atom_type in atom_type_list
         ])
         
-        # 获取所有原子的层级索引列表
-        atom_layer_list_all_atom = np.concatenate([
-            df_temp[df_temp['atom_type'] == atom_type]['layer'].values
+        # Get twist_group for all atoms
+        atom_twist_group_list_all_atom = np.concatenate([
+            df_temp[df_temp['atom_type'] == atom_type]['twist_group'].values
             for atom_type in atom_type_list
         ]).flatten()
         
-        # 获取所有原子的原子类型列表
+        # Get atom type for all atoms
         atom_type_list_all_atom = df_temp['atom_type'].values
         
         atom_orb_name_list = np.array([
@@ -417,71 +456,82 @@ class TAPW_parameters:
             for atom_type in atom_type_list
         ])
         
-        # 计算每种原子的因子
+        # Compute normalization factors
         factor_list = np.array([
             1 / np.sqrt(atom_num)
             for atom_num in atom_num_list
         ])
         
-        # 打印相关信息
+        # Print info
         print("atom_type_list = ", atom_type_list)
         print("atom_orb_num_list = ", atom_orb_num_list)
         print("atom_num_list = ", atom_num_list)
-        print("atom_layer_list = ", atom_layer_list)
+        print("atom_twist_group_list = ", atom_twist_group_list)
         print("atom_orb_name_list = ", atom_orb_name_list)
-        print("atom_type_list_all_atom = ", atom_type_list_all_atom)
-        print("atom_orb_num_list_all_atom = ", atom_orb_num_list_all_atom)
+        print(f"n_groups = {n_groups}")
         
-        # 获取 g_vec_list 的维度信息
-        # num_layers = g_vec_list.shape[0]
-        # num_g_per_layer = g_vec_list.shape[1]
-        dim_gr_1 = np.sum(atom_orb_num_list[atom_layer_list == i].sum() * len(g_vec_list[i]) for i in range(np.max(atom_layer_list) + 1))
+        # Compute dimensions
+        # dim_gr_1: sum over all groups of (orbitals in group * g_vecs in group)
+        dim_gr_1 = 0
+        for group_id in range(n_groups):
+            mask_group = atom_twist_group_list == group_id
+            n_orbs_in_group = atom_orb_num_list[mask_group].sum()
+            n_g_vecs_in_group = len(g_vec_list[group_id])
+            dim_gr_1 += n_orbs_in_group * n_g_vecs_in_group
+        
         dim_gr_2 = np.sum(atom_num_list * atom_orb_num_list)
         
-        print("dim_gr_1 = ", dim_gr_1)
-        print("dim_gr_2 = ", dim_gr_2)
+        print(f"dim_gr_1 = {dim_gr_1}")
+        print(f"dim_gr_2 = {dim_gr_2}")
         
-        # 初始化 gr_matrix
+        # Initialize gr_matrix
         gr_matrix = np.zeros((dim_gr_1, dim_gr_2), dtype=np.complex128)
         
-        # 生成 index_list_g
+        # Compute number of orbitals per group
+        orb_group_num = np.zeros(n_groups, dtype=int)
+        for group_id in range(n_groups):
+            mask = atom_twist_group_list == group_id
+            orb_group_num[group_id] = atom_orb_num_list[mask].sum()
+        
+        # Compute number of g-vectors per group
+        g_group_num = np.array([len(g_vec_list[i]) for i in range(n_groups)], dtype=int)
+        
+        # Generate index_list_g
         index_list_g = []
         g_list_index = 0
-        orb_layer_num = np.bincount(atom_layer_list, weights=atom_orb_num_list).astype(int)
-        # g_layern_num = np.array([g_vec_list.shape[1]] * g_vec_list.shape[0])
-        g_layern_num = np.array([len(g_vec_list[0]), len(g_vec_list[1])])
-        
-        for ilayer in range(np.max(atom_layer_list) + 1):
-            for i in range(len(g_vec_list[ilayer])):
+        for group_id in range(n_groups):
+            for i in range(len(g_vec_list[group_id])):
                 for j, atom_orb_num in enumerate(atom_orb_num_list):
-                    if atom_layer_list[j] != ilayer:
+                    if atom_twist_group_list[j] != group_id:
                         continue
                     g_list_index += 1
-                    shift1 = atom_orb_num_list[:j][atom_layer_list[:j] == ilayer].sum()
-                    shift2 = i * atom_orb_num_list[atom_layer_list == ilayer].sum()
-                    shift3 = np.dot(g_layern_num[:ilayer], orb_layer_num[:ilayer])
+                    # shift1: offset within this group for this atom type
+                    mask_same_group = atom_twist_group_list[:j] == group_id
+                    shift1 = atom_orb_num_list[:j][mask_same_group].sum()
+                    # shift2: offset for this g-vector within this group
+                    shift2 = i * orb_group_num[group_id]
+                    # shift3: offset for previous groups
+                    shift3 = np.dot(g_group_num[:group_id], orb_group_num[:group_id])
                     index_list = np.arange(atom_orb_num) + shift1 + shift2 + shift3
                     index_list_g.append(index_list)
         
-
-        
-        # 获取原子的位置信息
+        # Get atom positions
         pos_array = np.array(df_temp[['shifted_x', 'shifted_y']].values)
         
-        # 分配 gr_matrix 的对角元素
+        # Fill gr_matrix
         g_list_index = -1
-        for ilayer in range(np.max(atom_layer_list) + 1):
-            for i in range(len(g_vec_list[ilayer])):
+        for group_id in range(n_groups):
+            for i in range(len(g_vec_list[group_id])):
                 for j, atom_orb_num in enumerate(atom_orb_num_list):
-                    if atom_layer_list[j] != ilayer:
+                    if atom_twist_group_list[j] != group_id:
                         continue
                     g_list_index += 1
                     for iatom in range(len(atom_type_list_all_atom)):
-                        if (atom_layer_list_all_atom[iatom] != ilayer or
+                        if (atom_twist_group_list_all_atom[iatom] != group_id or
                             atom_type_list_all_atom[iatom] != j):
                             continue
                         r_vec = pos_array[iatom]
-                        g_vec = g_vec_list[ilayer][i]
+                        g_vec = g_vec_list[group_id][i]
                         gr_i_index_include = index_list_g[g_list_index]
                         gr_j_start = np.sum(atom_orb_num_list_all_atom[:iatom])
                         gr_j_end = gr_j_start + atom_orb_num_list_all_atom[iatom]
@@ -489,24 +539,36 @@ class TAPW_parameters:
                         
                         exp_val = np.exp(-1j * np.dot(g_vec, r_vec))
                         
-                        # 只赋值对角部分
                         gr_matrix[gr_i_index_include, gr_j_index_include] = [exp_val] * atom_orb_num_list_all_atom[iatom]
                         gr_matrix[gr_i_index_include, gr_j_index_include] *= factor_list[j]
         
-        # 应用因子
         print("factor_list = ", factor_list)
-        # gr_matrix = gr_matrix * factor_list[0]
         
-        # 计算共轭转置
+        # Compute conjugate transpose
         gr_matrix_conj = gr_matrix.T.conj()
         
-        print(np.real(gr_matrix @ gr_matrix_conj))
-        print(np.linalg.det(gr_matrix @ gr_matrix_conj))
+        # Check determinant (print summary only, not full matrix)
+        det_product = gr_matrix @ gr_matrix_conj
+        det_val = np.linalg.det(det_product)
+        max_abs = np.max(np.abs(det_product))
+        fro_norm = np.linalg.norm(det_product, 'fro')
+        print(f"gr_matrix @ gr_matrix_conj: shape={det_product.shape}, max_abs={max_abs:.6e}, fro_norm={fro_norm:.6e}")
+        print(f"det(gr_matrix @ gr_matrix_conj) = {det_val:.6e}")
         
         return scipy.linalg.block_diag(gr_matrix, gr_matrix) if spin else gr_matrix
 
     def generate_gr_matrix_gpu(self):
-        """Generate the g_matrix for TAPW using GPU."""
+        """Generate the g_matrix for TAPW using GPU (only supports bilayer n_groups=2)."""
+        # Check number of groups
+        if 'twist_group' not in self.structure.df.columns:
+            raise ValueError("structure.df must contain 'twist_group' column for GPU gr_matrix")
+        n_groups = len(self.structure.df['twist_group'].unique())
+        if n_groups != 2:
+            raise NotImplementedError(
+                f"GPU gr_matrix only supports bilayer (n_groups=2). "
+                f"Current n_groups={n_groups}. Use CPU for multi-group alternating."
+            )
+        
         n_wann_perlayer = int(len(self.structure.sort_wann) / 2)
         n_wann = n_wann_perlayer * 2
 
@@ -547,11 +609,152 @@ class TAPW_parameters:
         self.g_matrix = scipy.sparse.csr_matrix(cp.asnumpy(gr_mtrx))
 
     def generate_C3_matrix(self):
-        """Generate the C3_matrix"""
+        """Generate the C3_matrix (C3_H) for alternating multi-group stacks.
+
+        Representation conventions (must match generate_gr_matrix_cpu row ordering):
+        - Rows are ordered by twist_group major blocks 0..G-1.
+        - For each group g: basis is (G-vectors of that group) ⊗ (orbitals-of-atom-types in that group).
+        - Even group -> A orientation (K1 g-set); Odd group -> B orientation (K2 g-set).
+
+        This routine builds a block-diagonal C3 over groups (direct sum), where each group block is:
+            C3_group = C3_G(group_orientation) ⊗ C3_orb(group_species)
+        and optionally ⊗ C3_spin if spin is enabled.
+        """
+        if 'twist_group' not in self.structure.df.columns:
+            raise ValueError("structure.df must contain 'twist_group' column for C3_H")
+
+        df_temp = self.structure.df.copy()
+        unique_groups = sorted(df_temp['twist_group'].unique().tolist())
+        n_groups = len(unique_groups)
+        if unique_groups != list(range(n_groups)):
+            raise ValueError(f"twist_group must be continuous 0..{n_groups-1}, got {unique_groups}")
+
+        # Ensure g-vectors exist
+        if self.g_vec_list_K1 is None or self.g_vec_list_K2 is None:
+            raise ValueError("g_vec_list_K1/K2 are not initialized. Call generate_g_vec_list() first.")
+
+        # Build the two orientation-specific g-space C3 representations once.
+        # C3_G_matrix is bilayer-oriented: it returns reps for the (K1) and (K2) g-spaces.
+        C3_Gn_K1, C3_Gn_K2 = C3_G_matrix(
+            self.g_vec_list_K1,
+            self.g_vec_list_K2,
+            self.structure.reciprocal_Tmat,
+            self.structure.twist_index,
+            valley=self.valley,
+        )
+
+        # Helpers for orbital representation (only needed for multi-group)
+        from .C3_symm_01 import direct_sum, rot_matrix
+        from .rot_matrix import get_any_rot_orb_twostep
+
+        C3_rot_matrix = rot_matrix(120)
+        sigma_z = np.array([[1, 0], [0, -1]])
+        C3spin = scipy.linalg.expm(-1j * sigma_z / 2 * 2 * np.pi / 3)
+
+        C3_s = get_any_rot_orb_twostep('s', C3_rot_matrix)
+        C3_p = get_any_rot_orb_twostep('p', C3_rot_matrix)
+        C3_d = get_any_rot_orb_twostep('d', C3_rot_matrix)
+        C3_f = get_any_rot_orb_twostep('f', C3_rot_matrix)
+        orbital_mapping = {'s': C3_s, 'p': C3_p, 'd': C3_d, 'f': C3_f}
+
+        def parse_orbitals_from_orb_name(orb_name: str):
+            """Parse an OpenMX orb_name like 'Mo7.0-s3p2d1' into orbital radial counts dict."""
+            if not isinstance(orb_name, str):
+                raise ValueError(f"orb_name must be str, got {type(orb_name)}")
+            # Keep only the part after '-' (e.g. 's3p2d1')
+            if '-' in orb_name:
+                _, orb_part = orb_name.split('-', 1)
+            else:
+                orb_part = orb_name
+            orbitals = {}
+            for orb, count in re.findall(r'([spdf])(\d+)', orb_part):
+                orbitals[orb] = int(count)
+            if len(orbitals) == 0:
+                raise ValueError(f"Cannot parse orbitals from orb_name='{orb_name}'")
+            return orbitals
+
+        # Use the original generate_direct_sum_params from C3_symm_01 to ensure exact compatibility
+        from .C3_symm_01 import generate_direct_sum_params
+        
+        # Determine per-group atom-type ordering consistent with generate_gr_matrix_cpu:
+        # atom_type_list is sorted unique over the whole df.
+        atom_type_list_global = np.unique(df_temp['atom_type'].values)
+
+        C3_blocks = []
+        for gid in range(n_groups):
+            df_g = df_temp[df_temp['twist_group'] == gid]
+            if df_g.empty:
+                raise ValueError(f"No atoms found for twist_group={gid}")
+
+            # Orientation-specific g-space rep
+            C3_G = C3_Gn_K1 if (gid % 2 == 0) else C3_Gn_K2
+
+            # Build orbital rep over atom types in this group, ordered by global atom_type_list
+            group_atom_types = [at for at in atom_type_list_global if (df_g['atom_type'] == at).any()]
+            if len(group_atom_types) == 0:
+                raise ValueError(f"Group {gid} has no atom types")
+
+            C3_type_blocks = []
+            for at in group_atom_types:
+                orb_name = df_g.loc[df_g['atom_type'] == at, 'orb_name'].iloc[0]
+                orbitals_dict = parse_orbitals_from_orb_name(orb_name)
+                # Use original generate_direct_sum_params to match orbital ordering
+                params = generate_direct_sum_params(orbitals_dict, orbital_mapping)
+                C3_type_blocks.append(direct_sum(*params))
+
+            C3_orb = direct_sum(*C3_type_blocks)
+
+            # Combine: kron(C3_G, C3_orb)
+            C3_group = np.kron(C3_G, C3_orb)
+            C3_blocks.append(C3_group)
+            print(f"[C3] group {gid}: orientation={'K1' if gid%2==0 else 'K2'}, C3_G={C3_G.shape}, C3_orb={C3_orb.shape}, C3_group={C3_group.shape}")
+
+        # Direct sum across groups in gid order; this matches gr_matrix row block ordering.
+        C3_all_rep = direct_sum(*C3_blocks)
+        
+        # Spin is applied at the very end (after direct_sum), matching original C3_MoTe2_all implementation
+        if self.structure.spin:
+            C3_all_rep = np.kron(C3spin, C3_all_rep)
+        self.C3_matrix = scipy.sparse.csr_matrix(C3_all_rep)
+
+        C3_matrix_2 = self.C3_matrix @ self.C3_matrix
+        self.symm_matrix = [
+            scipy.sparse.csr_matrix(np.eye(self.C3_matrix.shape[0])),
+            self.C3_matrix,
+            C3_matrix_2,
+        ]
+        self.symm_matrix_inv = [
+            scipy.sparse.csr_matrix(np.eye(self.C3_matrix.shape[0])),
+            self.C3_matrix.conj().T,
+            C3_matrix_2.conj().T,
+        ]
+
+        print(f"[C3] Combined C3 matrix shape={self.C3_matrix.shape}, nnz={self.C3_matrix.nnz}")
+        return self.C3_matrix
+        
+    def generate_C3_matrix1(self):
+        """Generate the C3_matrix (only supports bilayer n_groups=2)."""
+        # Check number of groups
+        if 'twist_group' not in self.structure.df.columns:
+            raise ValueError("structure.df must contain 'twist_group' column for C3_H")
+        n_groups = len(self.structure.df['twist_group'].unique())
+        if n_groups != 2:
+            raise NotImplementedError(
+                f"C3_H is implemented only for bilayer (n_groups=2) in this codebase. "
+                f"Current n_groups={n_groups}. Multi-group representation is not implemented; "
+                f"using it would be incorrect (avoid silent wrong)."
+            )
+        
         df_temp = self.structure.df.copy()
         
         atom_type_list = np.unique(df_temp['atom_type'].values)
         
+        # Use twist_group instead of layer for grouping
+        atom_twist_group_list = np.array([
+            np.unique(df_temp[df_temp['atom_type'] == atom_type]['twist_group'].values)[0]
+            for atom_type in atom_type_list
+        ])
+        # For backward compatibility, also get layer (should equal phys_layer)
         atom_layer_list = np.array([
             np.unique(df_temp[df_temp['atom_type'] == atom_type]['layer'].values)[0]
             for atom_type in atom_type_list
@@ -641,22 +844,48 @@ class TAPW_parameters:
             scipy.sparse.csr_matrix(np.eye(self.C3_matrix.shape[0])),
             self.C3_matrix.conj().T, C3_matrix_2.conj().T
         ]
+        return self.C3_matrix
     
+
+
     def generate_g_symm_matrix(self):
         """Generate the g_symm_matrix"""
+        # Sanity check: C3 must act on the row-space of g_matrix
+        if self.symm_matrix is None or self.symm_matrix[1] is None:
+            raise ValueError("symm_matrix is not initialized. Call generate_C3_matrix() first.")
+        if self.symm_matrix[1].shape[0] != self.g_matrix.shape[0]:
+            raise ValueError(
+                f"C3 matrix dimension mismatch: symm_matrix[1].shape={self.symm_matrix[1].shape} "
+                f"but g_matrix.shape={self.g_matrix.shape}. "
+                "This indicates inconsistent basis ordering between C3 representation and gr_matrix rows."
+            )
         g_symm_matrix = self.symm_matrix[1] @ self.g_matrix
         g_symm_matrix_2 = self.symm_matrix[2] @ self.g_matrix
         g_symm_matrix_inv = self.g_matrix.conj().T @ self.symm_matrix_inv[1]
         g_symm_matrix_2_inv = self.g_matrix.conj().T @ self.symm_matrix_inv[2]
-        
         self.g_symm_matrix = [self.g_matrix, g_symm_matrix, g_symm_matrix_2]
         self.g_symm_matrix_inv = [self.g_matrix.conj().T, g_symm_matrix_inv, g_symm_matrix_2_inv]
 
     def generate_all_parameters(self):
         """Generate all TAPW parameters"""
+        # Check number of groups for GPU. GPU gr_matrix is bilayer-only.
+        if 'twist_group' in self.structure.df.columns:
+            n_groups = len(self.structure.df['twist_group'].unique())
+            if self.config.gpu and n_groups != 2:
+                raise NotImplementedError(
+                    f"GPU gr_matrix only supports bilayer (n_groups=2). "
+                    f"Current n_groups={n_groups}. Use CPU for multi-group alternating."
+                )
+
         self.generate_g_vec_list()
         self.generate_gr_matrix()
-        # self.generate_C3_matrix()
+        # test1 = self.generate_C3_matrix_test().toarray()
+        # test2 = self.generate_C3_matrix().toarray()
+        # np.save("/data/work/zy/software/1.tapw_code/tapw/examples/1.triangular_lattice/1.homo/1.MoTe2/AA/7.openmx_qk/3_9.43/tapw/Q_shell_2/C3test.npy",test1)
+        # np.save("/data/work/zy/software/1.tapw_code/tapw/examples/1.triangular_lattice/1.homo/1.MoTe2/AA/7.openmx_qk/3_9.43/tapw/Q_shell_2/C3.npy",test2)
+        # diff = np.sum(np.abs(test1 - test2))
+        # print("diff = ", diff)
+        # exit()
         if self.config.C3_H:
             self.generate_C3_matrix()
             self.generate_g_symm_matrix()

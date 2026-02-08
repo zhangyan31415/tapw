@@ -3,9 +3,14 @@
 # Twist parameters
 twist:
   twist_index_m: 3          # Twist index m, determines the twist angle
-  bravais: "hex"           # Bravais lattice type: "hex", "square", or "rect"
-  num_layers: 2             # Total number of layers in the structure
-  twist_layer: [1, 1]       # Which layers are twisted relative to each other
+  bravais: "hex"           # Bravais lattice type: "hex" or "square"
+  num_layers: 2             # Total number of physical layers (must equal sum(twist_layer))
+  twist_layer: [1, 1]       # Twist group layer counts (twist_layer_counts): number of physical layers per twist group
+                            # Example: [1, 1] = bilayer (A-B)
+                            # Example: [1, 2, 1] = A-AA-A (4 physical layers, 3 twist groups)
+                            # Example: [2, 1, 1] = AA-A-A (4 physical layers, 3 twist groups)
+                            # Must satisfy: sum(twist_layer) == num_layers
+  # type_structure: [1, 1]  # DEPRECATED: No longer used. Structure types are determined automatically via spglib.
   spin: true               # Whether to include spin in calculations
 
 # File paths and IO configuration
@@ -57,7 +62,7 @@ compute:
   eigsh_cal: true       # Use eigsh for eigenvalue calculation
   C3_H: false           # Apply C3 symmetry to Hamiltonian
   ge: false             # Use generalized eigenvalue solver
-  eig_vec_cal: true     # Calculate eigenvectors 
+  eig_vec_cal: false     # Calculate eigenvectors 
 
   # Electric field parameters
   Electric_field_in_eVpA: 0.00  # Electric field strength in eV/Å
