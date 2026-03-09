@@ -13,11 +13,16 @@ from datetime import datetime
 from functools import wraps
 Hartree = 27.21138602435532
 
+
+def _timing_enabled() -> bool:
+    value = os.environ.get("TAPW_ENABLE_TIMING", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
 def timing_decorator_factory(process_id):
     def timing_decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            if process_id == 0:
+            if process_id == 0 and _timing_enabled():
                 start_time = time.time()
                 process = psutil.Process()
                 mem_before = process.memory_info().rss / (1024 * 1024 * 1024)  # Convert to GB
