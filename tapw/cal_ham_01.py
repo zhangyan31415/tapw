@@ -12,10 +12,12 @@ import time
 import os
 import sys
 import multiprocessing as mp
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from numpy.lib.format import open_memmap
 from joblib import Parallel, delayed
+import joblib.parallel as joblib_parallel
 from .C3_symm_01 import C3_MoTe2_all, C3_G_matrix
 from tqdm import tqdm
 from .config import ComputeConfig
@@ -60,6 +62,25 @@ _NOTAPW_SLEPC_FACTOR_CANDIDATES = (
 _NOTAPW_SLEPC_SPD_SHIFT = 1.0e-10
 _NOTAPW_SLEPC_TOL = 1.0e-8
 _NOTAPW_SLEPC_MAX_IT = 5000
+
+
+@contextmanager
+def _tqdm_joblib(total: int, desc: str):
+    """Patch joblib callbacks so tqdm reflects completed tasks, not dispatched ones."""
+    original_callback = joblib_parallel.BatchCompletionCallBack
+    pbar = tqdm(total=total, desc=desc, unit="kpt", mininterval=5.0, dynamic_ncols=True)
+
+    class _TqdmBatchCompletionCallBack(original_callback):
+        def __call__(self, *args, **kwargs):
+            pbar.update(self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    joblib_parallel.BatchCompletionCallBack = _TqdmBatchCompletionCallBack
+    try:
+        yield pbar
+    finally:
+        joblib_parallel.BatchCompletionCallBack = original_callback
+        pbar.close()
 
 
 def _get_memmap(path: str) -> np.memmap:
@@ -2199,6 +2220,10 @@ class BandStructureCalculator:
                     tqdm(
                         pool.imap_unordered(_mp_kpoint_worker, zip(kpoint_indices, kpoints)),
                         total=len(kpoints),
+                        desc="k-points",
+                        unit="kpt",
+                        mininterval=5.0,
+                        dynamic_ncols=True,
                     )
                 )
             failed = [(i, err) for (i, ok, err, _) in statuses if not ok]
@@ -2251,13 +2276,21 @@ class BandStructureCalculator:
                 # Avoid joblib/loky overhead (and extra helper processes) for the common MPI-per-kpoint case.
                 results = [
                     _joblib_worker(i, kpoint)
-                    for i, kpoint in tqdm(zip(kpoint_indices, kpoints), total=len(kpoints))
+                    for i, kpoint in tqdm(
+                        zip(kpoint_indices, kpoints),
+                        total=len(kpoints),
+                        desc="k-points",
+                        unit="kpt",
+                        mininterval=5.0,
+                        dynamic_ncols=True,
+                    )
                 ]
             else:
-                results = Parallel(n_jobs=num_processes, backend=parallel_backend)(
-                    delayed(_joblib_worker)(i, kpoint)
-                    for i, kpoint in tqdm(zip(kpoint_indices, kpoints), total=len(kpoints))
-                )
+                with _tqdm_joblib(total=len(kpoints), desc="k-points"):
+                    results = Parallel(n_jobs=num_processes, backend=parallel_backend)(
+                        delayed(_joblib_worker)(i, kpoint)
+                        for i, kpoint in zip(kpoint_indices, kpoints)
+                    )
 
             if not use_memmap:
                 eig, vec, hamk, samk = zip(*results)
