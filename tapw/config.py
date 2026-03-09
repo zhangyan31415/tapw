@@ -129,7 +129,7 @@ class ComputeConfig:
     slepc_spd_shift: float = 0.0  # optional diagonal shift added to S(k) to improve definiteness (e.g. 1e-10)
     num_bands_cal: int = 50
     num_chern: int = 40
-    band_type: str = "CBM"  # Band type to analyze: "CBM" for conduction band minimum, "VBM" for valence band maximum
+    band_type: str = "BOTH"  # Band subset to save: "CBM", "VBM", or "BOTH"
     gpu: bool = False
     gpu_index: List[int] = field(default_factory=lambda: [0, 1])
     delay_time: int = 0  # seconds; stagger start a little to reduce I/O spikes (max delay is ~(workers-1)*delay_time)
