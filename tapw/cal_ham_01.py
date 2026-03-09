@@ -391,7 +391,6 @@ def _pick_available_slepc_factor_backend() -> str:
                 pc.setFactorSolverType(candidate)
             ksp.setUp()
             _SLEPC_FACTOR_PROBE_CACHE[key] = candidate
-            print(f"[slepc] selected LU backend: {candidate}", flush=True)
             return candidate
         except Exception:
             pass
