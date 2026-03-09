@@ -1444,8 +1444,8 @@ class BandStructureCalculator:
                 if self.config.ge:
                     hamk = self.Getk_super_gauge_sparse(self.hr_supercell, kpoints[:3], type = "H")
                     samk = self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3], type = "S")
-                    hamk = hamk.toarray()
-                    samk = samk.toarray()
+                    # hamk = hamk.toarray()
+                    # samk = samk.toarray()
                     w = eigsh(hamk, k=self.config.num_bands_cal, M=samk, 
                              sigma=self.config.efermi, which='LM', 
                              return_eigenvectors=self.config.eig_vec_cal)
@@ -1454,11 +1454,16 @@ class BandStructureCalculator:
         if self.config.eig_vec_cal:
             eig = np.sort(np.real(w[0]))
             vec = w[1][:, np.argsort(np.real(w[0]))]
-            if not self.config.hamk_save:
-                hamk, samk = 0, 0
         else:
             eig = np.sort(np.real(w))
             vec = 0
+
+        # IMPORTANT: Do not return/store per-kpoint H(k)/S(k) unless explicitly requested.
+        # Returning large matrices from joblib workers causes heavy pickling overhead and
+        # can easily blow up memory when running many k-points or using many workers.
+        if not self.config.hamk_save:
+            hamk = None
+            samk = None
         return eig, vec, hamk, samk
 
     @timing_decorator_factory(process_id=0)
@@ -1490,8 +1495,13 @@ class BandStructureCalculator:
 
         self.result['eig'] = np.array(eig)
         self.result['vec'] = np.array(vec)
-        self.result['hamk'] = hamk
-        self.result['samk'] = samk
+        if self.config.hamk_save:
+            self.result['hamk'] = hamk
+            self.result['samk'] = samk
+        else:
+            # Keep result dict lean when matrices are not requested.
+            self.result.pop('hamk', None)
+            self.result.pop('samk', None)
 
         end_time = time.time()
         print(f"Running time: {end_time - start_time:.2f} seconds")

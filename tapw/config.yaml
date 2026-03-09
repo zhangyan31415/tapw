@@ -47,7 +47,7 @@ compute:
   n_g: 3                  # Harmonic of G vectors
   
   # Band structure calculation parameters
-  num_processes: 61       # Number of parallel processes
+  num_processes: 21       # Number of parallel processes
   num_bands_cal: 200      # Number of bands to calculate
   num_chern: 40          # Number of k-points for Chern number calculation (grid size will be num_chern x num_chern)
   
@@ -62,7 +62,7 @@ compute:
   eigsh_cal: true       # Use eigsh for eigenvalue calculation
   C3_H: false           # Apply C3 symmetry to Hamiltonian
   ge: false             # Use generalized eigenvalue solver
-  eig_vec_cal: false     # Calculate eigenvectors 
+  eig_vec_cal: true     # Calculate eigenvectors 
 
   # Electric field parameters
   Electric_field_in_eVpA: 0.00  # Electric field strength in eV/Å
