@@ -12,6 +12,19 @@ from .read_kpath_01 import KPathGenerator
 from .read_hr_01 import HrSparseHandler
 from .tapw_slab import TAPWSlab
 
+def _mpi_world_rank_size() -> tuple[int, int]:
+    # Best-effort: works both under mpiexec/srun and in normal (non-MPI) runs.
+    try:
+        from mpi4py import MPI  # type: ignore
+
+        comm = MPI.COMM_WORLD
+        return int(comm.Get_rank()), int(comm.Get_size())
+    except Exception:
+        # Fallback to common env vars set by MPI launchers.
+        rank = int(os.environ.get("PMI_RANK") or os.environ.get("OMPI_COMM_WORLD_RANK") or "0")
+        size = int(os.environ.get("PMI_SIZE") or os.environ.get("OMPI_COMM_WORLD_SIZE") or "1")
+        return rank, size
+
 def setup_logging(log_file: str = None):
     """Setup logging configuration"""
     logging.basicConfig(
@@ -43,6 +56,20 @@ def parse_args():
                        help='Number of k-points for Chern number calculation (overrides config file)')
     parser.add_argument('--num_processes', type=int,
                        help='Number of processes (overrides config file)')
+    parser.add_argument('--blas_threads', type=int,
+                       help='BLAS/OpenMP threads per worker (overrides config file)')
+    parser.add_argument('--parallel_impl', choices=['joblib', 'mp'],
+                       help='Parallel implementation for k-point loop (overrides config file)')
+    parser.add_argument('--parallel_backend', choices=['loky', 'multiprocessing'],
+                       help='Joblib backend when parallel_impl=joblib (overrides config file)')
+    parser.add_argument('--vec_store', choices=['memory', 'memmap'],
+                       help='Where to store eigenvectors (overrides config file)')
+    parser.add_argument('--memmap_dir', type=str,
+                       help='Optional directory for memmap outputs (overrides config file)')
+    parser.add_argument('--kpoint_chunk_id', type=int,
+                       help='0-based chunk id for job-array sharding (overrides config file)')
+    parser.add_argument('--kpoint_chunk_count', type=int,
+                       help='Total chunk count for job-array sharding (overrides config file)')
     return parser.parse_args()
 
 def main():
@@ -50,25 +77,47 @@ def main():
     # Parse arguments and load configuration
     args = parse_args()
     config = Config.from_yaml(args.config)
+
+    mpi_rank, mpi_size = _mpi_world_rank_size()
     
     # Override config with command line arguments
-    if args.twist_index:
+    if args.twist_index is not None:
         config.twist.twist_index_m = args.twist_index
     if args.output_dir:
         config.paths.output_dir = args.output_dir
     if args.valleys:
         config.compute.valleys = args.valleys
+        config.compute.valley = args.valleys[0]
     if args.mode:
         config.compute.mode = args.mode
-    if args.n_g:
+    if args.n_g is not None:
         config.compute.n_g = args.n_g
-    if args.num_chern:
+    if args.num_chern is not None:
         config.compute.num_chern = args.num_chern
-    if args.num_processes:
+    if args.num_processes is not None:
         config.compute.num_processes = args.num_processes
+    if args.blas_threads is not None:
+        config.compute.blas_threads = args.blas_threads
+    if args.parallel_impl:
+        config.compute.parallel_impl = args.parallel_impl
+    if args.parallel_backend:
+        config.compute.parallel_backend = args.parallel_backend
+    if args.vec_store:
+        config.compute.vec_store = args.vec_store
+    if args.memmap_dir:
+        config.compute.memmap_dir = args.memmap_dir
+    if args.kpoint_chunk_id is not None:
+        config.compute.kpoint_chunk_id = args.kpoint_chunk_id
+    if args.kpoint_chunk_count is not None:
+        config.compute.kpoint_chunk_count = args.kpoint_chunk_count
+
+    # Re-check constraints after applying CLI overrides.
+    config.compute.validate()
+
     # Setup logging
     os.makedirs(config.paths.output_dir + "/logs", exist_ok=True)
-    log_file = Path(config.paths.output_dir + "/logs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    log_suffix = f"_rank{mpi_rank}" if mpi_size > 1 else ""
+    log_file = Path(config.paths.output_dir + "/logs") / f"run_{time.strftime('%Y%m%d_%H%M%S')}{log_suffix}.log"
     logger = setup_logging(str(log_file))
     logger.info("Starting calculation with configuration:")
     logger.info(f"Twist index: {config.twist.twist_index_m}")
@@ -167,6 +216,9 @@ def main():
         # Initialize k-path if needed
         kpath_config = None
         if config.compute.mode == "band":
+            # Avoid multiple MPI ranks clobbering the same KPATH.out.
+            if mpi_size > 1 and mpi_rank != 0:
+                config.paths.kpath_out = str(config.paths.kpath_out) + f".rank{mpi_rank}"
             kpath_config = KPathGenerator(structure.Tmat)
             kpath_config.read_and_generate_kpath(config.paths.kpath_in, config.paths.kpath_out)
         elif config.compute.mode == "slab":

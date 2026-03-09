@@ -11,6 +11,10 @@ from scipy.linalg import det
 import time
 import os
 import sys
+import multiprocessing as mp
+from types import SimpleNamespace
+
+from numpy.lib.format import open_memmap
 from joblib import Parallel, delayed
 from .C3_symm_01 import C3_MoTe2_all, C3_G_matrix
 from tqdm import tqdm
@@ -31,6 +35,452 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
+
+# Optional MKL-accelerated sparse GEMM (can be a big speedup for g@H@g^H)
+try:
+    from sparse_dot_mkl import dot_product_mkl  # type: ignore
+    _HAS_SPARSE_DOT_MKL = True
+except Exception:  # pragma: no cover
+    dot_product_mkl = None
+    _HAS_SPARSE_DOT_MKL = False
+
+
+_MEMMAP_CACHE: dict[str, np.memmap] = {}
+
+_SLEPC_FACTOR_PROBE_CACHE: dict[tuple[str, str], str] = {}
+_NOTAPW_SLEPC_FACTOR_CANDIDATES = (
+    "mkl_pardiso",
+    "mkl_cpardiso",
+    "mumps",
+    "superlu",
+    "umfpack",
+    "superlu_dist",
+    "petsc",
+)
+_NOTAPW_SLEPC_SPD_SHIFT = 1.0e-10
+_NOTAPW_SLEPC_TOL = 1.0e-8
+_NOTAPW_SLEPC_MAX_IT = 5000
+
+
+def _get_memmap(path: str) -> np.memmap:
+    mm = _MEMMAP_CACHE.get(path)
+    if mm is None:
+        mm = open_memmap(path, mode="r+")
+        _MEMMAP_CACHE[path] = mm
+    return mm
+
+
+def _acquire_mkdir_lock(lock_dir: str, poll_s: float = 0.2, max_wait_s: float = 600.0) -> None:
+    # Robust-enough cross-node lock using atomic mkdir.
+    # If a job dies while holding the lock, users may need to manually delete the lock dir.
+    deadline = time.time() + max_wait_s
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return
+        except FileExistsError:
+            if time.time() > deadline:
+                raise TimeoutError(f"Timeout waiting for lock: {lock_dir}")
+            time.sleep(poll_s)
+
+
+def _release_mkdir_lock(lock_dir: str) -> None:
+    try:
+        os.rmdir(lock_dir)
+    except OSError:
+        pass
+
+
+def _ensure_memmap_file(path: str, dtype, shape: tuple[int, ...]) -> None:
+    dir_ = os.path.dirname(path)
+    if dir_:
+        os.makedirs(dir_, exist_ok=True)
+    lock_dir = path + ".lock"
+    _acquire_mkdir_lock(lock_dir)
+    try:
+        if not os.path.exists(path):
+            mm = open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+            mm.flush()
+            del mm
+        else:
+            mm = open_memmap(path, mode="r+")
+            if mm.dtype != np.dtype(dtype) or mm.shape != tuple(shape):
+                raise ValueError(f"Memmap {path} has dtype={mm.dtype}, shape={mm.shape}, expected {dtype}, {shape}")
+            del mm
+    finally:
+        _release_mkdir_lock(lock_dir)
+
+
+_MP_STATE: dict[str, object] = {}
+
+_TPCTL_LIMITER = None
+_TPCTL_NTHREADS: int | None = None
+_AFFINITY_PINNED_PIDS: set[int] = set()
+
+
+def _set_thread_limits(nthreads: int | None) -> None:
+    """Best-effort BLAS/OpenMP thread limiting inside a process.
+
+    Why:
+      - In MKL builds, default thread counts can be large (tens of threads).
+      - If you also parallelize k-points with multiprocessing, you can easily get
+        massive oversubscription (hundreds of runnable threads) and slowdowns.
+    """
+    global _TPCTL_LIMITER, _TPCTL_NTHREADS
+    if nthreads is None:
+        return
+    try:
+        n = int(nthreads)
+    except Exception:
+        return
+    if n <= 0:
+        return
+    if _TPCTL_NTHREADS == n:
+        return
+
+    try:
+        from threadpoolctl import threadpool_limits  # type: ignore
+
+        # threadpool_limits applies limits on construction; keep a global ref so
+        # it is not garbage-collected (which could restore defaults).
+        _TPCTL_LIMITER = threadpool_limits(limits=n)
+        _TPCTL_NTHREADS = n
+    except Exception:
+        _TPCTL_LIMITER = None
+        _TPCTL_NTHREADS = None
+
+
+def _maybe_pin_current_worker(slot_width: int | None, worker_count: int | None) -> None:
+    """Best-effort CPU affinity for loky/joblib workers.
+
+    Why:
+      - On 4-socket bigmem nodes, many small OpenMP teams can drift across NUMA domains.
+      - Pinning each worker to a disjoint chunk of the Slurm cpuset reduces cross-socket traffic.
+      - This is only attempted inside worker processes whose names look like `LokyProcess-N`.
+    """
+    global _AFFINITY_PINNED_PIDS
+
+    if slot_width is None or worker_count is None:
+        return
+    try:
+        width = int(slot_width)
+        nworkers = int(worker_count)
+    except Exception:
+        return
+    if width <= 0 or nworkers <= 1:
+        return
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        return
+
+    pid = os.getpid()
+    if pid in _AFFINITY_PINNED_PIDS:
+        return
+
+    proc_name = mp.current_process().name
+    match = re.search(r"(\d+)$", proc_name or "")
+    if match is None:
+        return
+    worker_slot = max(int(match.group(1)) - 1, 0)
+
+    try:
+        allowed_cpus = sorted(os.sched_getaffinity(0))
+    except Exception:
+        return
+    if not allowed_cpus:
+        return
+
+    width = min(width, len(allowed_cpus))
+    slot_count = max(len(allowed_cpus) // width, 1)
+    slot = worker_slot % slot_count
+    start = slot * width
+    cpu_chunk = allowed_cpus[start : start + width]
+    if not cpu_chunk:
+        cpu_chunk = allowed_cpus
+
+    try:
+        os.sched_setaffinity(0, set(cpu_chunk))
+        _AFFINITY_PINNED_PIDS.add(pid)
+    except Exception:
+        return
+
+
+def _mp_worker_init(blas_threads: int) -> None:
+    # Called once per multiprocessing worker process.
+    _set_thread_limits(blas_threads)
+
+
+def _solve_eigs_slepc(hamk, samk, cfg: ComputeConfig) -> np.ndarray:
+    """SLEPc (slepc4py) eigenvalue solve for a single k-point (eigenvalues only)."""
+    try:
+        from petsc4py import PETSc  # type: ignore
+        from slepc4py import SLEPc  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise ImportError(
+            "eigensolver='slepc' requested but petsc4py/slepc4py is not available. "
+            "Install them into the active environment (tapw-mkl) and retry. "
+            f"Original import error: {e!r}"
+        ) from e
+
+    if getattr(cfg, "eig_vec_cal", False):
+        raise ValueError("eigensolver='slepc' currently supports eig_vec_cal=false only.")
+
+    slepc_comm = str(getattr(cfg, "slepc_comm", "self")).lower()
+    comm = PETSc.COMM_WORLD if slepc_comm == "world" else PETSc.COMM_SELF
+
+    A_csr_full = hamk.tocsr() if scipy.sparse.issparse(hamk) else scipy.sparse.csr_matrix(hamk)
+    B_csr_full = None
+    if samk is not None:
+        B_csr_full = samk.tocsr() if scipy.sparse.issparse(samk) else scipy.sparse.csr_matrix(samk)
+
+    # SLEPc GHEP assumes A and (especially) B define a valid Hermitian inner product.
+    # Tiny non-Hermitian noise (from file truncation / k-phase rounding) can make v^H B v
+    # have a small imaginary part and SLEPc will abort with error code 95.
+    if bool(getattr(cfg, "slepc_make_hermitian", True)):
+        A_csr_full = (A_csr_full + A_csr_full.getH()) * 0.5
+        if B_csr_full is not None:
+            B_csr_full = (B_csr_full + B_csr_full.getH()) * 0.5
+
+    spd_shift = float(getattr(cfg, "slepc_spd_shift", 0.0) or 0.0)
+    if spd_shift and B_csr_full is not None:
+        # Very small diagonal regularization can help if S(k) is near-singular/indefinite.
+        n = int(B_csr_full.shape[0])
+        B_csr_full = B_csr_full + (spd_shift * scipy.sparse.identity(n, format="csr", dtype=B_csr_full.dtype))
+
+    if np.iscomplexobj(A_csr_full.data) or (B_csr_full is not None and np.iscomplexobj(B_csr_full.data)):
+        if np.dtype(PETSc.ScalarType).kind != "c":
+            raise RuntimeError(
+                "H(k)/S(k) is complex but PETSc in this environment is real-valued. "
+                "Install complex PETSc/SLEPc (conda-forge complex build) and retry."
+            )
+
+    n_global = int(A_csr_full.shape[0])
+    if comm.getSize() > 1:
+        # Row-block distribution: each rank stores its local row slice in PETSc.
+        # NOTE: each rank still constructs the full scipy CSR and then slices.
+        rank = comm.getRank()
+        size = comm.getSize()
+        rstart = (rank * n_global) // size
+        rend = ((rank + 1) * n_global) // size
+        A_csr = A_csr_full[rstart:rend, :].tocsr()
+        B_csr = B_csr_full[rstart:rend, :].tocsr() if B_csr_full is not None else None
+        A_csr_full = None
+        B_csr_full = None
+    else:
+        A_csr = A_csr_full
+        B_csr = B_csr_full
+
+    indptr = np.asarray(A_csr.indptr, dtype=np.int32)
+    indices = np.asarray(A_csr.indices, dtype=np.int32)
+    data = np.asarray(A_csr.data, dtype=PETSc.ScalarType, order="C")
+    if comm.getSize() > 1:
+        # petsc4py expects size=((m,M),(n,N)) where (m,n) are local sizes.
+        A = PETSc.Mat().createAIJ(
+            # Make the parallel row/col layout identical (required by EPS for square operators).
+            size=((int(A_csr.shape[0]), n_global), (int(A_csr.shape[0]), n_global)),
+            csr=(indptr, indices, data),
+            comm=comm,
+        )
+    else:
+        A = PETSc.Mat().createAIJ(size=A_csr.shape, csr=(indptr, indices, data), comm=comm)
+    A.assemble()
+    A.setOption(PETSc.Mat.Option.HERMITIAN, True)
+
+    B = None
+    if B_csr is not None:
+        indptr_b = np.asarray(B_csr.indptr, dtype=np.int32)
+        indices_b = np.asarray(B_csr.indices, dtype=np.int32)
+        data_b = np.asarray(B_csr.data, dtype=PETSc.ScalarType, order="C")
+        if comm.getSize() > 1:
+            B = PETSc.Mat().createAIJ(
+                size=((int(B_csr.shape[0]), n_global), (int(B_csr.shape[0]), n_global)),
+                csr=(indptr_b, indices_b, data_b),
+                comm=comm,
+            )
+        else:
+            B = PETSc.Mat().createAIJ(size=B_csr.shape, csr=(indptr_b, indices_b, data_b), comm=comm)
+        B.assemble()
+        B.setOption(PETSc.Mat.Option.HERMITIAN, True)
+        B.setOption(PETSc.Mat.Option.SPD, True)
+
+    eps = SLEPc.EPS().create(comm=comm)
+    if B is None:
+        eps.setOperators(A)
+        eps.setProblemType(SLEPc.EPS.ProblemType.HEP)
+    else:
+        eps.setOperators(A, B)
+        eps.setProblemType(SLEPc.EPS.ProblemType.GHEP)
+
+    eps.setType(str(getattr(cfg, "slepc_eps_type", "krylovschur")))
+    nev = int(getattr(cfg, "num_bands_cal", 0))
+    if nev <= 0:
+        raise ValueError("num_bands_cal must be > 0 for SLEPc.")
+    eps.setDimensions(nev, PETSc.DECIDE)
+
+    target = float(getattr(cfg, "efermi", 0.0))
+    eps.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
+    eps.setTarget(target)
+
+    st = eps.getST()
+    st.setType(str(getattr(cfg, "slepc_st_type", "sinvert")))
+    st.setShift(target)
+
+    ksp = st.getKSP()
+    ksp.setType(str(getattr(cfg, "slepc_ksp_type", "preonly")))
+    pc = ksp.getPC()
+    pc.setType(str(getattr(cfg, "slepc_pc_type", "lu")))
+    factor = str(getattr(cfg, "slepc_factor_mat_solver_type", "") or "").strip()
+    if factor and factor.lower() != "petsc":
+        pc.setFactorSolverType(factor)
+
+    tol = float(getattr(cfg, "slepc_tol", 1e-8))
+    max_it = int(getattr(cfg, "slepc_max_it", 5000))
+    eps.setTolerances(tol, max_it)
+    eps.setFromOptions()
+    try:
+        eps.solve()
+    except Exception as e:
+        # Re-raise with a more actionable message for the most common failure mode.
+        msg = str(e)
+        if "error code 95" in msg or "inner product is not well defined" in msg:
+            raise RuntimeError(
+                "SLEPc failed with an inner-product error (often caused by S(k) not being strictly Hermitian/HPD). "
+                "Try setting compute.slepc_make_hermitian: true (default) and/or a small compute.slepc_spd_shift "
+                "(e.g. 1e-10). If it still fails, your overlap matrix may not satisfy GHEP assumptions."
+            ) from e
+        raise
+
+    nconv = int(eps.getConverged())
+    if nconv <= 0:
+        raise RuntimeError("SLEPc failed to converge any eigenpairs for this k-point.")
+    nret = min(nev, nconv)
+    evals = np.empty(nret, dtype=float)
+    for i in range(nret):
+        lam = eps.getEigenvalue(i)
+        evals[i] = float(np.real(lam))
+    return np.sort(evals)
+
+
+def _pick_available_slepc_factor_backend() -> str:
+    """Probe PETSc LU packages and return the best available backend."""
+    key = (sys.executable, os.environ.get("LD_LIBRARY_PATH", ""))
+    cached = _SLEPC_FACTOR_PROBE_CACHE.get(key)
+    if cached:
+        return cached
+
+    from petsc4py import PETSc  # type: ignore
+
+    probe = PETSc.Mat().createAIJ(
+        size=(4, 4),
+        csr=(
+            np.array([0, 2, 4, 6, 8], dtype=np.int32),
+            np.array([0, 1, 1, 2, 2, 3, 0, 3], dtype=np.int32),
+            np.array([4.0, 1.0, 4.0, 1.0, 4.0, 1.0, 1.0, 4.0], dtype=PETSc.ScalarType),
+        ),
+        comm=PETSc.COMM_SELF,
+    )
+    probe.assemble()
+
+    for candidate in _NOTAPW_SLEPC_FACTOR_CANDIDATES:
+        ksp = PETSc.KSP().create(comm=PETSc.COMM_SELF)
+        try:
+            ksp.setOperators(probe)
+            ksp.setType("preonly")
+            pc = ksp.getPC()
+            pc.setType("lu")
+            if candidate.lower() != "petsc":
+                pc.setFactorSolverType(candidate)
+            ksp.setUp()
+            _SLEPC_FACTOR_PROBE_CACHE[key] = candidate
+            print(f"[slepc] selected LU backend: {candidate}", flush=True)
+            return candidate
+        except Exception:
+            pass
+        finally:
+            try:
+                ksp.destroy()
+            except Exception:
+                pass
+
+    _SLEPC_FACTOR_PROBE_CACHE[key] = "petsc"
+    return "petsc"
+
+
+def _solve_notapw_generalized_eigs(hamk, samk, cfg: ComputeConfig):
+    """Solve the non-TAPW generalized problem using the configured backend.
+
+    For `eigensolver="slepc"` we intentionally use a fixed single-node strategy
+    that mirrors the benchmarked path:
+    - COMM_SELF
+    - shift-invert + LU
+    - auto-probed PETSc LU backend (prefer MKL Pardiso when available)
+    - small SPD shift on S
+    """
+    eigensolver = str(getattr(cfg, "eigensolver", "scipy")).lower()
+    if eigensolver == "slepc":
+        if getattr(cfg, "eig_vec_cal", False):
+            raise ValueError("non-TAPW eigensolver='slepc' currently supports eig_vec_cal=false only.")
+
+        factor_backend = _pick_available_slepc_factor_backend()
+        slepc_cfg = SimpleNamespace(
+            eig_vec_cal=False,
+            slepc_comm="self",
+            slepc_make_hermitian=True,
+            slepc_spd_shift=_NOTAPW_SLEPC_SPD_SHIFT,
+            num_bands_cal=int(getattr(cfg, "num_bands_cal", 0)),
+            efermi=float(getattr(cfg, "efermi", 0.0)),
+            slepc_eps_type="krylovschur",
+            slepc_st_type="sinvert",
+            slepc_ksp_type="preonly",
+            slepc_pc_type="lu",
+            slepc_factor_mat_solver_type=factor_backend,
+            slepc_tol=_NOTAPW_SLEPC_TOL,
+            slepc_max_it=_NOTAPW_SLEPC_MAX_IT,
+        )
+        return _solve_eigs_slepc(hamk, samk, slepc_cfg)
+
+    return eigsh(
+        hamk,
+        k=cfg.num_bands_cal,
+        M=samk,
+        sigma=cfg.efermi,
+        which="LM",
+        return_eigenvectors=cfg.eig_vec_cal,
+    )
+
+
+def _mp_kpoint_worker(args: tuple[int, np.ndarray]) -> tuple[int, bool, str | None, object | None]:
+    # Must be top-level for multiprocessing pickling.
+    i, kpoint = args
+    calc = _MP_STATE["calc"]  # BandStructureCalculator
+    cfg = _MP_STATE["cfg"]  # ComputeConfig
+    eig_path = _MP_STATE.get("eig_path")
+    vec_path = _MP_STATE.get("vec_path")
+    use_memmap = bool(_MP_STATE.get("use_memmap"))
+
+    # Stagger start a little to avoid hitting the filesystem at the exact same time.
+    delay_time = getattr(cfg, "delay_time", 0)
+    if delay_time:
+        nproc = max(int(getattr(cfg, "num_processes", 1)), 1)
+        time.sleep((i % nproc) * delay_time)
+
+    try:
+        # Safety: in case the Pool initializer was not used for some reason.
+        _set_thread_limits(getattr(cfg, "blas_threads", None))
+        eig, vec, hamk, samk = calc.calculate_band_01(kpoint, i)
+
+        if use_memmap and eig_path is not None:
+            eig_mm = _get_memmap(str(eig_path))
+            eig_mm[i, : eig.shape[0]] = eig
+            if getattr(cfg, "eig_vec_cal", False) and vec_path is not None and vec is not None:
+                vec_mm = _get_memmap(str(vec_path))
+                vec_mm[i, :, : vec.shape[1]] = vec
+            return i, True, None, None
+
+        # In non-memmap mode, return the results to the parent so it can assemble
+        # self.result["eig"]/["vec"] in memory (original behavior).
+        return i, True, None, (eig, vec, hamk, samk)
+    except Exception as e:  # pragma: no cover
+        return i, False, str(e), None
 
 class TAPW_parameters:
     """TAPW parameters for twisted material calculations"""
@@ -368,194 +818,170 @@ class TAPW_parameters:
         
         print(f"Total twist groups: {n_groups}")
         self.g_matrix = self.generate_gr_matrix_cpu(self.structure.df, g_vec_list, spin=self.structure.spin)
-        self.g_matrix_conj = self.g_matrix.T.conj()
-        
-        delta = np.abs(det(self.g_matrix @ self.g_matrix_conj))
-        self.g_matrix = scipy.sparse.csr_matrix(self.g_matrix)
-        self.g_matrix_conj = scipy.sparse.csr_matrix(self.g_matrix_conj)
-        
-        if delta < 1.0e-2:
-            raise Exception("np.abs(det(gr_mtrx @ gr_mtrx.T.conj())) < 1.0e-2")
+        if scipy.sparse.issparse(self.g_matrix):
+            self.g_matrix = self.g_matrix.tocsr()
         else:
-            print("np.abs(det(gr_mtrx @ gr_mtrx.T.conj())) = ", delta)
+            self.g_matrix = scipy.sparse.csr_matrix(self.g_matrix)
+        self.g_matrix.sort_indices()
+
+        # Cache conjugate transpose for fast g@H@g^H multiplication.
+        self.g_matrix_conj = self.g_matrix.conj().T.tocsr()
+        self.g_matrix_conj.sort_indices()
+
+        # Lightweight orthonormality check (much cheaper than det(g g^H)).
+        row_norm2 = np.asarray(self.g_matrix.multiply(self.g_matrix.conj()).sum(axis=1)).ravel().real
+        max_dev = float(np.max(np.abs(row_norm2 - 1.0))) if row_norm2.size else 0.0
+        print(f"g_matrix row-norm check: max|norm^2-1|={max_dev:.3e}")
+        if max_dev > 1.0e-2:
+            raise Exception(f"g_matrix row norms deviate too much: max|norm^2-1|={max_dev:.3e}")
         
     @staticmethod
     def generate_gr_matrix_cpu(structure_df, g_vec_list, spin=None):
+        """Generate gr_matrix (sparse) using twist_group assignment (generalized for n_groups >= 2).
+
+        This version builds the matrix directly as sparse COO/CSR (instead of allocating a huge dense
+        matrix and then converting), and avoids the extremely expensive determinant sanity checks.
+
+        Expected/assumed invariants (same as the original implementation):
+        - `atom_type` values are 0..n_types-1 and are stable identifiers.
+        - All atoms of the same `atom_type` belong to the same `twist_group`.
+        - All atoms of the same `atom_type` have the same `orb_num`.
         """
-        Generate gr_matrix using twist_group assignment (generalized for n_groups >= 2).
-        
-        Parameters:
-        - structure_df (pd.DataFrame): Must contain:
-            - 'atom_type': Atom type
-            - 'orb_num': Number of orbitals per atom
-            - 'twist_group': Twist group index (0..n_groups-1)
-            - 'shifted_x', 'shifted_y': Atom coordinates
-        - g_vec_list (list): List of g-vector arrays, one per twist_group
-            g_vec_list[i] corresponds to twist_group=i
-        - spin: Whether to include spin (block diagonal)
-        
-        Returns:
-        - gr_matrix (np.ndarray): Shape (dim_gr_1, dim_gr_2)
-        """
-        # Check required columns
         required_cols = ['atom_type', 'orb_num', 'twist_group', 'shifted_x', 'shifted_y']
         for col in required_cols:
             if col not in structure_df.columns:
                 raise ValueError(f"structure_df must contain '{col}' column")
-        
-        # Copy DataFrame to avoid modifying original
+
         df_temp = structure_df.copy()
-        
-        # Get unique twist groups and validate
-        unique_groups = sorted(df_temp['twist_group'].unique())
+        # Preserve the original column-packing convention: atoms are grouped by atom_type.
+        df_temp = df_temp.sort_values(['atom_type'], kind='stable').reset_index(drop=True)
+
+        atom_type_all = df_temp['atom_type'].to_numpy(dtype=int, copy=False)
+        orb_num_all = df_temp['orb_num'].to_numpy(dtype=int, copy=False)
+        twist_group_all = df_temp['twist_group'].to_numpy(dtype=int, copy=False)
+        pos_array = df_temp[['shifted_x', 'shifted_y']].to_numpy(dtype=float, copy=False)
+
+        unique_groups = sorted(np.unique(twist_group_all).tolist())
         n_groups = len(unique_groups)
         if unique_groups != list(range(n_groups)):
             raise ValueError(f"twist_group must be continuous 0..{n_groups-1}, got {unique_groups}")
-        
         if len(g_vec_list) != n_groups:
             raise ValueError(f"g_vec_list length ({len(g_vec_list)}) != n_groups ({n_groups})")
-        
-        # Get unique atom types
-        atom_type_list = np.unique(df_temp['atom_type'].values)
-        
-        # Get orbital numbers per atom type
-        atom_orb_num_list = np.array([
-            np.unique(df_temp[df_temp['atom_type'] == atom_type]['orb_num'].values)[0]
-            for atom_type in atom_type_list
-        ])
-        
-        # Get orbital numbers for all atoms
-        atom_orb_num_list_all_atom = np.concatenate([
-            df_temp[df_temp['atom_type'] == atom_type]['orb_num'].values
-            for atom_type in atom_type_list
-        ]).flatten()
-        
-        # Get atom counts per type
-        atom_num_list = np.array([
-            len(df_temp[df_temp['atom_type'] == atom_type])
-            for atom_type in atom_type_list
-        ])
-        
-        # Get twist_group per atom type (assume all atoms of same type have same group)
-        atom_twist_group_list = np.array([
-            np.unique(df_temp[df_temp['atom_type'] == atom_type]['twist_group'].values)[0]
-            for atom_type in atom_type_list
-        ])
-        
-        # Get twist_group for all atoms
-        atom_twist_group_list_all_atom = np.concatenate([
-            df_temp[df_temp['atom_type'] == atom_type]['twist_group'].values
-            for atom_type in atom_type_list
-        ]).flatten()
-        
-        # Get atom type for all atoms
-        atom_type_list_all_atom = df_temp['atom_type'].values
-        
-        atom_orb_name_list = np.array([
-            np.unique(df_temp[df_temp['atom_type'] == atom_type]['orb_name'].values)[0]
-            for atom_type in atom_type_list
-        ])
-        
-        # Compute normalization factors
-        factor_list = np.array([
-            1 / np.sqrt(atom_num)
-            for atom_num in atom_num_list
-        ])
-        
-        # Print info
+
+        atom_type_list = np.unique(atom_type_all)
+        if not np.array_equal(atom_type_list, np.arange(atom_type_list.size)):
+            raise ValueError(f"atom_type must be 0..n_types-1, got {atom_type_list}")
+        n_types = int(atom_type_list.size)
+
+        atom_orb_num_list = np.zeros(n_types, dtype=int)
+        atom_num_list = np.zeros(n_types, dtype=int)
+        atom_twist_group_list = np.zeros(n_types, dtype=int)
+        atom_orb_name_list = np.array([str(i) for i in range(n_types)], dtype=object)
+        if 'orb_name' in df_temp.columns:
+            atom_orb_name_list = np.zeros(n_types, dtype=object)
+
+        for t in range(n_types):
+            mask = atom_type_all == t
+            cnt = int(np.sum(mask))
+            if cnt == 0:
+                raise ValueError(f"atom_type {t} has no atoms")
+            atom_num_list[t] = cnt
+
+            orb0 = int(orb_num_all[mask][0])
+            atom_orb_num_list[t] = orb0
+            if not np.all(orb_num_all[mask] == orb0):
+                raise ValueError(f"Inconsistent orb_num for atom_type {t}")
+
+            grp0 = int(twist_group_all[mask][0])
+            atom_twist_group_list[t] = grp0
+            if not np.all(twist_group_all[mask] == grp0):
+                raise ValueError(f"Inconsistent twist_group for atom_type {t}")
+
+            if 'orb_name' in df_temp.columns:
+                atom_orb_name_list[t] = df_temp.loc[mask, 'orb_name'].iloc[0]
+
+        factor_list = 1.0 / np.sqrt(atom_num_list.astype(np.float64))
+
         print("atom_type_list = ", atom_type_list)
         print("atom_orb_num_list = ", atom_orb_num_list)
         print("atom_num_list = ", atom_num_list)
         print("atom_twist_group_list = ", atom_twist_group_list)
         print("atom_orb_name_list = ", atom_orb_name_list)
         print(f"n_groups = {n_groups}")
-        
-        # Compute dimensions
-        # dim_gr_1: sum over all groups of (orbitals in group * g_vecs in group)
-        dim_gr_1 = 0
-        for group_id in range(n_groups):
-            mask_group = atom_twist_group_list == group_id
-            n_orbs_in_group = atom_orb_num_list[mask_group].sum()
-            n_g_vecs_in_group = len(g_vec_list[group_id])
-            dim_gr_1 += n_orbs_in_group * n_g_vecs_in_group
-        
-        dim_gr_2 = np.sum(atom_num_list * atom_orb_num_list)
-        
-        print(f"dim_gr_1 = {dim_gr_1}")
-        print(f"dim_gr_2 = {dim_gr_2}")
-        
-        # Initialize gr_matrix
-        gr_matrix = np.zeros((dim_gr_1, dim_gr_2), dtype=np.complex128)
-        
-        # Compute number of orbitals per group
+
         orb_group_num = np.zeros(n_groups, dtype=int)
         for group_id in range(n_groups):
-            mask = atom_twist_group_list == group_id
-            orb_group_num[group_id] = atom_orb_num_list[mask].sum()
-        
-        # Compute number of g-vectors per group
+            orb_group_num[group_id] = int(atom_orb_num_list[atom_twist_group_list == group_id].sum())
         g_group_num = np.array([len(g_vec_list[i]) for i in range(n_groups)], dtype=int)
-        
-        # Generate index_list_g
-        index_list_g = []
-        g_list_index = 0
+
+        dim_gr_1 = int(np.dot(g_group_num, orb_group_num))
+        dim_gr_2 = int(np.sum(atom_num_list * atom_orb_num_list))
+        print(f"dim_gr_1 = {dim_gr_1}")
+        print(f"dim_gr_2 = {dim_gr_2}")
+
+        # shift3[group] = sum_{g'<group} g_group_num[g'] * orb_group_num[g']
+        shift3 = np.zeros(n_groups, dtype=int)
         for group_id in range(n_groups):
-            for i in range(len(g_vec_list[group_id])):
-                for j, atom_orb_num in enumerate(atom_orb_num_list):
+            shift3[group_id] = int(np.dot(g_group_num[:group_id], orb_group_num[:group_id]))
+
+        # shift1[type] = sum of orbitals of previous types in the same group
+        shift1 = np.zeros(n_types, dtype=int)
+        for j in range(n_types):
+            group_id = atom_twist_group_list[j]
+            if j > 0:
+                shift1[j] = int(atom_orb_num_list[:j][atom_twist_group_list[:j] == group_id].sum())
+
+        # Column offsets for each atom in df_temp order (grouped by atom_type).
+        col_offsets = np.cumsum(np.r_[0, orb_num_all[:-1]]).astype(np.int64)
+
+        rows_parts: list[np.ndarray] = []
+        cols_parts: list[np.ndarray] = []
+        data_parts: list[np.ndarray] = []
+
+        for group_id in range(n_groups):
+            gvecs = np.asarray(g_vec_list[group_id], dtype=np.float64)
+            if gvecs.ndim != 2 or gvecs.shape[1] != 2:
+                raise ValueError(f"g_vec_list[{group_id}] must have shape (Ng, 2), got {gvecs.shape}")
+
+            for gi, g_vec in enumerate(gvecs):
+                shift2 = int(gi * orb_group_num[group_id])
+                for j in range(n_types):
                     if atom_twist_group_list[j] != group_id:
                         continue
-                    g_list_index += 1
-                    # shift1: offset within this group for this atom type
-                    mask_same_group = atom_twist_group_list[:j] == group_id
-                    shift1 = atom_orb_num_list[:j][mask_same_group].sum()
-                    # shift2: offset for this g-vector within this group
-                    shift2 = i * orb_group_num[group_id]
-                    # shift3: offset for previous groups
-                    shift3 = np.dot(g_group_num[:group_id], orb_group_num[:group_id])
-                    index_list = np.arange(atom_orb_num) + shift1 + shift2 + shift3
-                    index_list_g.append(index_list)
-        
-        # Get atom positions
-        pos_array = np.array(df_temp[['shifted_x', 'shifted_y']].values)
-        
-        # Fill gr_matrix
-        g_list_index = -1
-        for group_id in range(n_groups):
-            for i in range(len(g_vec_list[group_id])):
-                for j, atom_orb_num in enumerate(atom_orb_num_list):
-                    if atom_twist_group_list[j] != group_id:
+
+                    orb_num = int(atom_orb_num_list[j])
+                    row_base = int(shift1[j] + shift2 + shift3[group_id])
+                    row_idx = (row_base + np.arange(orb_num, dtype=np.int64))[None, :]
+
+                    atom_idx = np.nonzero((twist_group_all == group_id) & (atom_type_all == j))[0]
+                    if atom_idx.size == 0:
                         continue
-                    g_list_index += 1
-                    for iatom in range(len(atom_type_list_all_atom)):
-                        if (atom_twist_group_list_all_atom[iatom] != group_id or
-                            atom_type_list_all_atom[iatom] != j):
-                            continue
-                        r_vec = pos_array[iatom]
-                        g_vec = g_vec_list[group_id][i]
-                        gr_i_index_include = index_list_g[g_list_index]
-                        gr_j_start = np.sum(atom_orb_num_list_all_atom[:iatom])
-                        gr_j_end = gr_j_start + atom_orb_num_list_all_atom[iatom]
-                        gr_j_index_include = np.arange(gr_j_start, gr_j_end)
-                        
-                        exp_val = np.exp(-1j * np.dot(g_vec, r_vec))
-                        
-                        gr_matrix[gr_i_index_include, gr_j_index_include] = [exp_val] * atom_orb_num_list_all_atom[iatom]
-                        gr_matrix[gr_i_index_include, gr_j_index_include] *= factor_list[j]
-        
+
+                    phase = np.exp(-1j * (pos_array[atom_idx] @ g_vec))
+                    col_base = col_offsets[atom_idx]
+                    col_idx = col_base[:, None] + np.arange(orb_num, dtype=np.int64)[None, :]
+
+                    rows_parts.append(np.broadcast_to(row_idx, col_idx.shape).reshape(-1))
+                    cols_parts.append(col_idx.reshape(-1))
+                    data_parts.append(np.broadcast_to((phase * factor_list[j])[:, None], col_idx.shape).reshape(-1))
+
+        if not rows_parts:
+            raise ValueError("No entries generated for gr_matrix; check inputs.")
+
+        rows = np.concatenate(rows_parts)
+        cols = np.concatenate(cols_parts)
+        data = np.concatenate(data_parts).astype(np.complex128, copy=False)
+
+        gr = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(dim_gr_1, dim_gr_2), dtype=np.complex128).tocsr()
+        gr.sort_indices()
+        density = gr.nnz / float(dim_gr_1 * dim_gr_2) if dim_gr_1 and dim_gr_2 else 0.0
+        print(f"gr_matrix built: shape={gr.shape}, nnz={gr.nnz}, density={density:.3e}")
         print("factor_list = ", factor_list)
-        
-        # Compute conjugate transpose
-        gr_matrix_conj = gr_matrix.T.conj()
-        
-        # Check determinant (print summary only, not full matrix)
-        det_product = gr_matrix @ gr_matrix_conj
-        det_val = np.linalg.det(det_product)
-        max_abs = np.max(np.abs(det_product))
-        fro_norm = np.linalg.norm(det_product, 'fro')
-        print(f"gr_matrix @ gr_matrix_conj: shape={det_product.shape}, max_abs={max_abs:.6e}, fro_norm={fro_norm:.6e}")
-        print(f"det(gr_matrix @ gr_matrix_conj) = {det_val:.6e}")
-        
-        return scipy.linalg.block_diag(gr_matrix, gr_matrix) if spin else gr_matrix
+
+        if spin:
+            gr = scipy.sparse.block_diag((gr, gr), format='csr')
+            gr.sort_indices()
+        return gr
 
     def generate_gr_matrix_gpu(self):
         """Generate the g_matrix for TAPW using GPU (only supports bilayer n_groups=2)."""
@@ -925,6 +1351,12 @@ class BandStructureCalculator:
             raise ValueError(f"Invalid valley configuration. Must be one of {list(self.VALLEY_MAP.keys())}")
         
         self.valley_flag = self.VALLEY_MAP[self.config.valley]
+
+        # Cache for (orbital-expanded) Wannier coordinates used by Getk_super_gauge_sparse.
+        # This avoids rebuilding `sorted_wann` for every rvec loop and every k-point.
+        self._sorted_wann: np.ndarray | None = None
+        self._num_wann: int | None = None
+        self._ef_onsite_orb: np.ndarray | None = None
         
         if self.config.TAPW:
             self.TAPW_parameters = TAPW_parameters(self.structure, self.config)
@@ -932,6 +1364,31 @@ class BandStructureCalculator:
             
         if self.config.gpu and cp is None:
             raise ImportError("CuPy is not installed. Please install CuPy to use GPU acceleration.")
+
+    def _ensure_sorted_wann_cache(self) -> None:
+        if self._sorted_wann is not None and self._num_wann is not None:
+            return
+        df = self.structure.df
+        coords = df[['x', 'y', 'z']].to_numpy(dtype=np.float64, copy=False)
+        orb_num = df['orb_num'].to_numpy(dtype=int, copy=False)
+        sorted_wann = np.repeat(coords, orb_num, axis=0)
+        if self.structure.spin:
+            sorted_wann = np.concatenate([sorted_wann, sorted_wann], axis=0)
+
+        self._sorted_wann = sorted_wann
+        self._num_wann = int(sorted_wann.shape[0])
+
+        # Precompute electric-field onsite term expanded to orbitals (if used).
+        ef = None
+        if hasattr(self, 'TAPW_parameters'):
+            ef = getattr(self.TAPW_parameters, 'electric_field_onsite', None)
+        if ef is not None:
+            ef_orb = np.repeat(np.asarray(ef, dtype=np.float64), orb_num)
+            if self.structure.spin:
+                ef_orb = np.tile(ef_orb, 2)
+            self._ef_onsite_orb = ef_orb
+        else:
+            self._ef_onsite_orb = None
 
     def generate_kmesh(self, num_k):
         """Generate a uniform k-point mesh for Chern number calculation
@@ -1062,6 +1519,34 @@ class BandStructureCalculator:
             if self.kpath_config is None:
                 raise ValueError("Must provide either kpoints or kpath_config")
             kpoints = self.kpath_config.kpoints
+
+        # Suffix used in filenames (also reused by memmap outputs)
+        mode = getattr(self.config, "mode", None)
+        suffix = "_2d" if mode == "chern" else ""
+        if mode == "chern" and hasattr(self.config, "num_chern"):
+            suffix += f"_{self.config.num_chern}"
+
+        # Optional k-point chunking for job arrays / multi-node runs.
+        kpoints_all = kpoints
+        nk_total = int(len(kpoints_all))
+        chunk_id = int(getattr(self.config, "kpoint_chunk_id", 0))
+        chunk_count = int(getattr(self.config, "kpoint_chunk_count", 1))
+        if chunk_count < 1:
+            raise ValueError("kpoint_chunk_count must be >= 1")
+        if not (0 <= chunk_id < chunk_count):
+            raise ValueError(f"kpoint_chunk_id must be in [0, {chunk_count - 1}], got {chunk_id}")
+
+        if chunk_count > 1:
+            start = (nk_total * chunk_id) // chunk_count
+            end = (nk_total * (chunk_id + 1)) // chunk_count
+            kpoints = kpoints_all[start:end]
+            kpoint_indices = list(range(start, end))
+            print(
+                f"[k-chunk] chunk {chunk_id}/{chunk_count}: indices [{start}:{end}) "
+                f"({len(kpoints)}/{nk_total})"
+            )
+        else:
+            kpoint_indices = list(range(nk_total))
         
         # Save g-vectors if using TAPW
         if self.config.TAPW:
@@ -1073,45 +1558,136 @@ class BandStructureCalculator:
             np.save(os.path.join(path, f"C3_matrix_{self.valley_flag}"),
                    self.TAPW_parameters.C3_matrix.toarray())
         # Calculate bands
-        self.parallel_calculate_band_01(kpoints)
+        self.parallel_calculate_band_01(
+            kpoints,
+            kpoint_indices=kpoint_indices,
+            nk_total=nk_total,
+            out_dir=path,
+            suffix=suffix,
+        )
+
+        # MPI COMM_WORLD SLEPc mode: all ranks participate in EPSSolve collectively, but only rank 0
+        # should write outputs to avoid file clobbering.
+        if (
+            getattr(self.config, "eigensolver", "scipy") == "slepc"
+            and str(getattr(self.config, "slepc_comm", "self")).lower() == "world"
+        ):
+            try:
+                from mpi4py import MPI  # type: ignore
+
+                comm = MPI.COMM_WORLD
+                if comm.Get_size() > 1:
+                    comm.Barrier()
+                    if comm.Get_rank() != 0:
+                        return
+            except Exception:
+                pass
+
+        # In chunked mode we only compute/write raw eig/vec (memmap) slices. Post-process after all chunks finish.
+        if chunk_count > 1:
+            kpoints_path = os.path.join(path, f"kpoints{suffix}.npy")
+            _ensure_memmap_file(kpoints_path, np.float64, np.asarray(kpoints_all).shape)
+            mm_k = _get_memmap(kpoints_path)
+            mm_k[:] = np.asarray(kpoints_all)
+            mm_k.flush()
+            print(
+                f"[k-chunk] Wrote raw memmap slices. "
+                f"Run a separate postprocess step after all {chunk_count} chunks complete."
+            )
+            return
         
         # Save results
         band_data = self.result['eig']
-        suffix = "_2d" if getattr(self.config, "mode", None) == "chern" else ""
         # 在chern模式下，添加num_chern标识
-        if getattr(self.config, "mode", None) == "chern" and hasattr(self.config, "num_chern"):
-            suffix += f"_{self.config.num_chern}"
+        if mode == "chern":
             os.makedirs(os.path.join(path, "topo"), exist_ok=True)
-            path = os.path.join(path, "topo")
+            out_path = os.path.join(path, "topo")
         else:
             os.makedirs(os.path.join(path, "band"), exist_ok=True)
-            path = os.path.join(path, "band")
+            out_path = os.path.join(path, "band")
         
         # Split bands and eigenvectors by fermi energy
+        band_type = str(getattr(self.config, "band_type", "")).upper()
+        want_vbm = band_type not in {"CBM"}
+        want_cbm = band_type not in {"VBM"}
+
         vec_data = self.result['vec'] if self.config.eig_vec_cal else None
-        filtered, vbm, cbm, pivot_col, vbm_vecs, cbm_vecs = self.split_vbm_cbm_with_vec(
-            band_data, vec_data, self.config.efermi)
+        if getattr(self.config, "vec_store", "memory") == "memmap" and vec_data is not None:
+            # Streamed postprocess: avoid materializing (nk, dim, nb) in RAM.
+            energies = np.asarray(band_data)
+            first_indices = self.find_first_above_energy(energies, self.config.efermi)
+            min_index = int(np.min(first_indices))
+            max_index = int(np.max(first_indices))
+            n_all = int(energies.shape[1])
+            n_keep = int(n_all - (max_index - min_index))
+            if n_keep <= 0:
+                raise ValueError(f"No bands to keep after alignment (n_keep={n_keep}). Check efermi={self.config.efermi}")
+
+            pivot_col = min_index
+            filtered = np.empty((energies.shape[0], n_keep), dtype=energies.dtype)
+            for k in range(energies.shape[0]):
+                start = int(first_indices[k] - min_index)
+                end = start + n_keep
+                filtered[k] = energies[k, start:end]
+
+            vbm = filtered[:, :pivot_col] if pivot_col > 0 else np.array([]).reshape(filtered.shape[0], 0)
+            cbm = filtered[:, pivot_col:] if pivot_col < filtered.shape[1] else np.array([]).reshape(filtered.shape[0], 0)
+
+            # Prepare output memmaps for requested band_type(s)
+            vbm_mm = None
+            cbm_mm = None
+            if want_vbm and vbm.shape[1] > 0:
+                vbm_path = os.path.join(out_path, f"vec_VBM_{self.valley_flag}_valley{suffix}.npy")
+                _ensure_memmap_file(vbm_path, np.complex128, (energies.shape[0], vec_data.shape[1], vbm.shape[1]))
+                vbm_mm = open_memmap(vbm_path, mode="r+")
+            if want_cbm and cbm.shape[1] > 0:
+                cbm_path = os.path.join(out_path, f"vec_CBM_{self.valley_flag}_valley{suffix}.npy")
+                _ensure_memmap_file(cbm_path, np.complex128, (energies.shape[0], vec_data.shape[1], cbm.shape[1]))
+                cbm_mm = open_memmap(cbm_path, mode="r+")
+
+            for k in tqdm(range(energies.shape[0]), desc="Postprocess vec", total=energies.shape[0]):
+                start = int(first_indices[k] - min_index)
+                end = start + n_keep
+                if vbm_mm is not None and cbm_mm is not None:
+                    vec_keep = vec_data[k, :, start:end]
+                    vbm_mm[k] = vec_keep[:, :pivot_col]
+                    cbm_mm[k] = vec_keep[:, pivot_col:]
+                elif vbm_mm is not None:
+                    vbm_mm[k] = vec_data[k, :, start : start + pivot_col]
+                elif cbm_mm is not None:
+                    cbm_mm[k] = vec_data[k, :, start + pivot_col : end]
+
+            if vbm_mm is not None:
+                vbm_mm.flush()
+            if cbm_mm is not None:
+                cbm_mm.flush()
+
+            vbm_vecs = None
+            cbm_vecs = None
+        else:
+            filtered, vbm, cbm, pivot_col, vbm_vecs, cbm_vecs = self.split_vbm_cbm_with_vec(
+                band_data, vec_data, self.config.efermi)
         
         # Save VBM data if exists
-        if vbm.size > 0:
-            np.savetxt(os.path.join(path, f"band_VBM_{self.valley_flag}_valley{suffix}.txt"),
+        if want_vbm and vbm.size > 0:
+            np.savetxt(os.path.join(out_path, f"band_VBM_{self.valley_flag}_valley{suffix}.txt"),
                       vbm, fmt='%15.11f')
         
         # Save CBM data if exists  
-        if cbm.size > 0:
-            np.savetxt(os.path.join(path, f"band_CBM_{self.valley_flag}_valley{suffix}.txt"),
+        if want_cbm and cbm.size > 0:
+            np.savetxt(os.path.join(out_path, f"band_CBM_{self.valley_flag}_valley{suffix}.txt"),
                       cbm, fmt='%15.11f')
         
         # Save eigenvectors if calculated
         if self.config.eig_vec_cal:
-            if vbm_vecs is not None and vbm_vecs.size > 0:
-                np.save(os.path.join(path, f"vec_VBM_{self.valley_flag}_valley{suffix}"), vbm_vecs)
-            if cbm_vecs is not None and cbm_vecs.size > 0:
-                np.save(os.path.join(path, f"vec_CBM_{self.valley_flag}_valley{suffix}"), cbm_vecs)
+            if want_vbm and vbm_vecs is not None and vbm_vecs.size > 0:
+                np.save(os.path.join(out_path, f"vec_VBM_{self.valley_flag}_valley{suffix}"), vbm_vecs)
+            if want_cbm and cbm_vecs is not None and cbm_vecs.size > 0:
+                np.save(os.path.join(out_path, f"vec_CBM_{self.valley_flag}_valley{suffix}"), cbm_vecs)
         
         # Save Hamiltonian if requested
         if self.config.hamk_save:
-            np.save(os.path.join(path, f"hamk_{self.valley_flag}_valley{suffix}"), self.result['hamk'])
+            np.save(os.path.join(out_path, f"hamk_{self.valley_flag}_valley{suffix}"), self.result['hamk'])
 
     def calculate_chern(self, path):
         """Calculate Chern number using uniform k-point mesh
@@ -1173,42 +1749,64 @@ class BandStructureCalculator:
     def Getk_super_gauge_sparse(self, Hr, k, type = "H"):
         """Get k-space Hamiltonian from real space Hamiltonian"""
         kvec = self.get_kvec(k)
-        # print(self.structure.df)
-        # exit()
-        sorted_wann_x = self.structure.df['x'].values
-        sorted_wann_y = self.structure.df['y'].values
-        sorted_wann_z = self.structure.df['z'].values
-        sorted_wann = np.repeat(np.array([sorted_wann_x, sorted_wann_y, sorted_wann_z]).T,
-                               self.structure.df['orb_num'].values, axis=0)
+        self._ensure_sorted_wann_cache()
+        sorted_wann = self._sorted_wann
+        num_wann = self._num_wann
+        if sorted_wann is None or num_wann is None:
+            raise RuntimeError("sorted_wann cache is not initialized")
 
-        if self.structure.spin:
-            sorted_wann = np.concatenate([sorted_wann, sorted_wann], axis=0)
-        
-        num_wann = len(sorted_wann)
-        mk = scipy.sparse.csr_matrix((num_wann, num_wann), dtype=np.complex128)
-        
-        for rvec, values_dic in Hr.items():
-            row_index, col_index, val_index = values_dic["row"], values_dic["col"], values_dic["val"]
-            m_coor, n_coor = sorted_wann[row_index], sorted_wann[col_index]
-            Rvec = np.dot(rvec, self.structure.Tmat)
-            phase_factor = np.exp(-1j * np.dot(m_coor - n_coor, kvec)) * np.exp(1j * np.dot(kvec, Rvec))
-            mk += scipy.sparse.csr_matrix((val_index * phase_factor, (row_index, col_index)), 
-                                         shape=(num_wann, num_wann))
+        use_fast = bool(getattr(self.config, "fast_getk", True))
+        if use_fast:
+            # Precompute (wann_center · kvec) once per k-point, then reuse via indexing.
+            # This avoids many tiny BLAS GEMV calls (width=3) inside the rvec loop, which can be
+            # surprisingly slow especially under MKL/OpenMP.
+            phase_wann = (
+                sorted_wann[:, 0] * kvec[0]
+                + sorted_wann[:, 1] * kvec[1]
+                + sorted_wann[:, 2] * kvec[2]
+            )
+
+            # Build in one shot (COO->CSR) instead of repeated CSR additions.
+            # This is usually much faster for large Hr/Sr.
+            nnz_total = int(sum(len(v["val"]) for v in Hr.values()))
+            rows = np.empty(nnz_total, dtype=np.int64)
+            cols = np.empty(nnz_total, dtype=np.int64)
+            data = np.empty(nnz_total, dtype=np.complex128)
+
+            off = 0
+            for rvec, values_dic in Hr.items():
+                row_index = np.asarray(values_dic["row"], dtype=np.int64)
+                col_index = np.asarray(values_dic["col"], dtype=np.int64)
+                val_index = np.asarray(values_dic["val"]).astype(np.complex128, copy=False)
+                n = int(val_index.shape[0])
+
+                rows[off : off + n] = row_index
+                cols[off : off + n] = col_index
+
+                Rvec = np.dot(rvec, self.structure.Tmat)
+                exp_kR = np.exp(1j * np.dot(kvec, Rvec))
+                dot_mn = phase_wann[row_index] - phase_wann[col_index]
+                phase_factor = np.exp(-1j * dot_mn) * exp_kR
+                data[off : off + n] = val_index * phase_factor
+                off += n
+
+            mk = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(num_wann, num_wann), dtype=np.complex128).tocsr()
+            mk.sum_duplicates()
+        else:
+            mk = scipy.sparse.csr_matrix((num_wann, num_wann), dtype=np.complex128)
+            for rvec, values_dic in Hr.items():
+                row_index, col_index, val_index = values_dic["row"], values_dic["col"], values_dic["val"]
+                m_coor, n_coor = sorted_wann[row_index], sorted_wann[col_index]
+                Rvec = np.dot(rvec, self.structure.Tmat)
+                phase_factor = np.exp(-1j * np.dot(m_coor - n_coor, kvec)) * np.exp(1j * np.dot(kvec, Rvec))
+                mk += scipy.sparse.csr_matrix(
+                    (np.asarray(val_index).astype(np.complex128, copy=False) * phase_factor, (row_index, col_index)),
+                    shape=(num_wann, num_wann),
+                )
 
         # --- 电场修正：加到对角元 ---
-        ef_onsite = None
-        if type == "H":
-            if hasattr(self, 'TAPW_parameters') and self.TAPW_parameters.electric_field_onsite is not None:
-                # 需要扩展到所有轨道（每个原子有多个轨道）
-                orb_num = self.structure.df['orb_num'].values
-                ef_onsite = np.repeat(self.TAPW_parameters.electric_field_onsite, orb_num)
-                if self.structure.spin:
-                    ef_onsite = np.tile(ef_onsite, 2)
-                # print("orb_num = ", orb_num)
-                # exit()
-                # print("self.TAPW_parameters.electric_field_onsite = ", self.TAPW_parameters.electric_field_onsite)
-                # print("ef_onsite = ", ef_onsite.shape,ef_onsite)
-                mk = mk + scipy.sparse.diags(ef_onsite, 0, shape=(num_wann, num_wann), dtype=np.float64)
+        if type == "H" and self._ef_onsite_orb is not None:
+            mk = mk + scipy.sparse.diags(self._ef_onsite_orb, 0, shape=(num_wann, num_wann), dtype=np.float64)
         return mk
 
     @timing_decorator_factory(process_id=0)
@@ -1337,10 +1935,32 @@ class BandStructureCalculator:
     @timing_decorator_factory(process_id=0)
     def gen_H_new_cpu(self, hamk, samk):
         """CPU version of Hamiltonian transformation"""
-        S_eig, S_vec = scipy.linalg.eigh(samk)
-        M_inv = np.diag(1 / np.sqrt(S_eig))
-        UMinvUd = S_vec @ M_inv @ S_vec.conj().T
-        return UMinvUd @ hamk @ UMinvUd
+        # Reduce generalized Hermitian EVP to standard form.
+        #
+        # Prefer Cholesky (S = L L^H): much faster and lower-memory than the
+        # symmetric-orthogonalization route (eigh(S) -> S^{-1/2}).
+        #
+        # If S is not positive definite (numerical issues), fall back to the
+        # original robust (but expensive) method.
+        try:
+            L = scipy.linalg.cholesky(samk, lower=True, check_finite=False)
+            # A = L^{-1} H L^{-H}
+            X = scipy.linalg.solve_triangular(L, hamk, lower=True, trans='N', check_finite=False)
+            A_T = scipy.linalg.solve_triangular(L.conj().T, X.T, lower=False, trans='N', check_finite=False)
+            hamk_new = A_T.T
+            # Numerical symmetrization (should be Hermitian).
+            hamk_new = (hamk_new + hamk_new.conj().T) / 2
+            return hamk_new
+        except Exception:
+            S_eig, S_vec = scipy.linalg.eigh(samk, check_finite=False)
+            # Guard against tiny/negative eigenvalues due to numerical noise.
+            eps = np.finfo(S_eig.dtype).eps
+            S_eig = np.clip(S_eig, eps, None)
+            M_inv = np.diag(1 / np.sqrt(S_eig))
+            UMinvUd = S_vec @ M_inv @ S_vec.conj().T
+            hamk_new = UMinvUd @ hamk @ UMinvUd
+            hamk_new = (hamk_new + hamk_new.conj().T) / 2
+            return hamk_new
     
     @timing_decorator_factory(process_id=0)
     def gen_H_new_gpu(self, hamk, samk, gpu_index=0):
@@ -1380,8 +2000,18 @@ class BandStructureCalculator:
 
     def cal_TAPW_hamiltonian_k_cpu(self, hamk):
         """CPU version of TAPW Hamiltonian calculation"""
-        result = self.TAPW_parameters.g_matrix @ hamk @ self.TAPW_parameters.g_matrix_conj
-        return result.toarray()
+        g = self.TAPW_parameters.g_matrix
+        gH = self.TAPW_parameters.g_matrix_conj
+
+        use_sparse_dot = bool(getattr(self.config, "use_sparse_dot_mkl", False))
+        if use_sparse_dot and _HAS_SPARSE_DOT_MKL and scipy.sparse.issparse(g) and scipy.sparse.issparse(hamk) and scipy.sparse.issparse(gH):
+            # MKL sparse GEMM is multi-threaded and usually much faster than SciPy's sparse matmul.
+            tmp = dot_product_mkl(g, hamk, dense=False)
+            out = dot_product_mkl(tmp, gH, dense=True)
+            return out
+
+        result = g @ hamk @ gH
+        return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
     
     @timing_decorator_factory(process_id=0)
     def Getk_super_gauge_sparse_symm_final_HS(self, Hr, Sr, symm_matrix, symm_matrix_inv, k, mpi_index):
@@ -1426,7 +2056,8 @@ class BandStructureCalculator:
                     w = eigsh(hamk, k=self.config.num_bands_cal, sigma=self.config.efermi, 
                               which='LM', return_eigenvectors=self.config.eig_vec_cal)
                 else:
-                    w = scipy.linalg.eigh(hamk.toarray() if scipy.sparse.issparse(hamk) else hamk)
+                    a = hamk.toarray() if scipy.sparse.issparse(hamk) else hamk
+                    w = scipy.linalg.eigh(a, eigvals_only=not self.config.eig_vec_cal, check_finite=False)
             else:
                 if self.config.eigsh_cal:
                     if self.config.ge:
@@ -1437,66 +2068,223 @@ class BandStructureCalculator:
                         w = eigsh(hamk, k=self.config.num_bands_cal, sigma=self.config.efermi, 
                                  which='LM', return_eigenvectors=self.config.eig_vec_cal)
                 else:
-                    w = lapack.zhegv(hamk, samk, itype=1, 
-                                    jobz='V' if self.config.eig_vec_cal else 'N')
+                    a = hamk.toarray() if scipy.sparse.issparse(hamk) else hamk
+                    if self.config.ge and samk is not None:
+                        b = samk.toarray() if scipy.sparse.issparse(samk) else samk
+                        w = scipy.linalg.eigh(a, b, eigvals_only=not self.config.eig_vec_cal, check_finite=False)
+                    else:
+                        w = scipy.linalg.eigh(a, eigvals_only=not self.config.eig_vec_cal, check_finite=False)
         else:
-            if self.config.eigsh_cal:
-                if self.config.ge:
-                    hamk = self.Getk_super_gauge_sparse(self.hr_supercell, kpoints[:3], type = "H")
-                    samk = self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3], type = "S")
-                    hamk = hamk.toarray()
-                    samk = samk.toarray()
-                    w = eigsh(hamk, k=self.config.num_bands_cal, M=samk, 
-                             sigma=self.config.efermi, which='LM', 
-                             return_eigenvectors=self.config.eig_vec_cal)
-                else:
-                    raise ValueError("Not implemented! Recommend to use generalized eigenvalue solver.")
+            if self.config.ge:
+                hamk = self.Getk_super_gauge_sparse(self.hr_supercell, kpoints[:3], type="H")
+                samk = None if self.config.orthogonal_basis else self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3], type="S")
+                w = _solve_notapw_generalized_eigs(hamk, samk, self.config)
+            else:
+                raise ValueError("Not implemented! Recommend to use generalized eigenvalue solver (ge=true).")
         if self.config.eig_vec_cal:
             eig = np.sort(np.real(w[0]))
             vec = w[1][:, np.argsort(np.real(w[0]))]
-            if not self.config.hamk_save:
-                hamk, samk = 0, 0
         else:
             eig = np.sort(np.real(w))
-            vec = 0
+            vec = None
+
+        # IMPORTANT: Do not return/store per-kpoint H(k)/S(k) unless explicitly requested.
+        # Returning large matrices from joblib workers causes heavy pickling overhead and
+        # can easily blow up memory when running many k-points or using many workers.
+        if not self.config.hamk_save:
+            hamk = None
+            samk = None
         return eig, vec, hamk, samk
 
     @timing_decorator_factory(process_id=0)
-    def parallel_calculate_band_01(self, kpoints):
-        """Calculate band structure for all k-points in parallel"""
+    def parallel_calculate_band_01(self, kpoints, kpoint_indices=None, nk_total=None, out_dir=None, suffix=""):
+        """Calculate band structure for all k-points in parallel.
+
+        Key performance points:
+        - Limit BLAS/OpenMP threads inside each worker via `blas_threads` to avoid oversubscription.
+        - For large k-mesh + wavefunctions, set `vec_store="memmap"` so workers write slices to disk and
+          avoid returning huge arrays through joblib (pickle overhead + RAM blow-ups).
+        """
         start_time = time.time()
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        sys.stdout.flush() 
+        sys.stdout.flush()
         print(f"Current Time: {current_time}")
-        print(f"Running with num_processes = {self.config.num_processes}")
-                
-        def print_time(stage):
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(f"{stage} Current Time: {current_time}")
-            sys.stdout.flush()
 
-        def delayed_calculate_band_01(kpoint, delay):
-            time.sleep(delay * self.config.delay_time)
-            result = self.calculate_band_01(kpoint, delay)
-            print(f"=============================     Kpoint {delay} {kpoint} finished    =============================")
-            return result
+        num_processes = int(getattr(self.config, "num_processes", 1))
+        blas_threads = int(getattr(self.config, "blas_threads", 1))
+        parallel_impl = getattr(self.config, "parallel_impl", "joblib")
+        parallel_backend = getattr(self.config, "parallel_backend", "loky")
+        vec_store = getattr(self.config, "vec_store", "memory")
 
-        delays = [i for i in range(len(kpoints))]
-        tasks = [delayed(delayed_calculate_band_01)(kpoint, delay) 
-                for kpoint, delay in tqdm(zip(kpoints, delays))]
-        result = Parallel(n_jobs=self.config.num_processes)(tasks)
+        print(
+            "Parallel config: "
+            f"impl={parallel_impl} backend={parallel_backend} "
+            f"num_processes={num_processes} blas_threads={blas_threads} vec_store={vec_store}"
+        )
 
-        eig, vec, hamk, samk = zip(*result)
+        if kpoint_indices is None:
+            kpoint_indices = list(range(len(kpoints)))
+        if nk_total is None:
+            nk_total = len(kpoints)
+        if len(kpoint_indices) != len(kpoints):
+            raise ValueError("kpoint_indices length must match kpoints length")
+        kpoint_indices = [int(i) for i in kpoint_indices]
 
-        self.result['eig'] = np.array(eig)
-        self.result['vec'] = np.array(vec)
-        self.result['hamk'] = hamk
-        self.result['samk'] = samk
+        use_memmap = (vec_store == "memmap") or (int(getattr(self.config, "kpoint_chunk_count", 1)) > 1)
+
+        eig_path = None
+        vec_path = None
+        if use_memmap:
+            root = getattr(self.config, "memmap_dir", None) or out_dir or os.getcwd()
+            memmap_dir = os.path.join(root, "memmap")
+            os.makedirs(memmap_dir, exist_ok=True)
+
+            # File names include the same suffix as the final outputs, so different modes/num_chern don't collide.
+            eig_path = os.path.join(memmap_dir, f"eig_raw_{self.valley_flag}_valley{suffix}.npy")
+            vec_path = os.path.join(memmap_dir, f"vec_raw_{self.valley_flag}_valley{suffix}.npy")
+
+            nb = int(self.config.num_bands_cal) if getattr(self.config, "eigsh_cal", True) else None
+            dim = int(self.TAPW_parameters.g_matrix.shape[0]) if getattr(self.config, "TAPW", False) else None
+            if nb is None or dim is None:
+                raise ValueError("memmap mode requires TAPW=True and eigsh_cal=True (fixed num_bands_cal).")
+
+            _ensure_memmap_file(eig_path, np.float64, (int(nk_total), nb))
+            if getattr(self.config, "eig_vec_cal", False):
+                _ensure_memmap_file(vec_path, np.complex128, (int(nk_total), dim, nb))
+            else:
+                vec_path = None
+
+            # Keep handles in this process for downstream post-processing.
+            self.result["eig_path"] = eig_path
+            self.result["vec_path"] = vec_path
+            self.result["eig"] = open_memmap(eig_path, mode="r+")
+            self.result["vec"] = open_memmap(vec_path, mode="r+") if vec_path is not None else None
+
+        def _joblib_worker(i, kpoint):
+            _maybe_pin_current_worker(blas_threads, num_processes)
+            _set_thread_limits(blas_threads)
+            delay_time = getattr(self.config, "delay_time", 0)
+            if delay_time:
+                time.sleep((i % max(num_processes, 1)) * delay_time)
+            eig, vec, hamk, samk = self.calculate_band_01(kpoint, i)
+
+            if use_memmap and eig_path is not None:
+                eig_mm = _get_memmap(eig_path)
+                eig_mm[i, : eig.shape[0]] = eig
+                if getattr(self.config, "eig_vec_cal", False) and vec_path is not None and vec is not None:
+                    vec_mm = _get_memmap(vec_path)
+                    vec_mm[i, :, : vec.shape[1]] = vec
+                return i, True, None
+
+            return eig, vec, hamk, samk
+
+        if parallel_impl == "mp":
+            # Fork-based pool avoids repeatedly pickling a huge calculator object.
+            ctx = mp.get_context("fork")
+            _MP_STATE.clear()
+            _MP_STATE.update(
+                {
+                    "calc": self,
+                    "cfg": self.config,
+                    "eig_path": eig_path,
+                    "vec_path": vec_path,
+                    "use_memmap": use_memmap,
+                }
+            )
+            with ctx.Pool(
+                processes=num_processes,
+                initializer=_mp_worker_init,
+                initargs=(blas_threads,),
+            ) as pool:
+                statuses = list(
+                    tqdm(
+                        pool.imap_unordered(_mp_kpoint_worker, zip(kpoint_indices, kpoints)),
+                        total=len(kpoints),
+                    )
+                )
+            failed = [(i, err) for (i, ok, err, _) in statuses if not ok]
+            if failed:
+                raise RuntimeError(f"{len(failed)} k-points failed, first: {failed[0]}")
+            if not use_memmap:
+                # Assemble results in memory, matching the original (joblib) behavior.
+                eig_arr = None
+                vec_arr = None
+                want_vec = bool(getattr(self.config, "eig_vec_cal", False))
+                want_hamk = bool(getattr(self.config, "hamk_save", False))
+                hamk_list = [None] * nk_total if want_hamk else None
+                samk_list = [None] * nk_total if want_hamk else None
+
+                for (i, ok, err, payload) in statuses:
+                    if not ok:
+                        raise RuntimeError(err or f"k-point {i} failed")
+                    if payload is None:
+                        raise RuntimeError(f"Missing payload for k-point {i} in non-memmap mp mode")
+                    eig, vec, hamk, samk = payload
+                    eig = np.asarray(eig)
+                    if eig_arr is None:
+                        eig_arr = np.empty((nk_total, eig.shape[0]), dtype=eig.dtype)
+                    eig_arr[i, : eig.shape[0]] = eig
+
+                    if want_vec:
+                        if vec is None:
+                            raise RuntimeError(f"eig_vec_cal=True but vec is None for k-point {i}")
+                        vec = np.asarray(vec)
+                        if vec_arr is None:
+                            vec_arr = np.empty((nk_total, vec.shape[0], vec.shape[1]), dtype=vec.dtype)
+                        vec_arr[i, :, : vec.shape[1]] = vec
+
+                    if want_hamk and hamk_list is not None and samk_list is not None:
+                        hamk_list[i] = hamk
+                        samk_list[i] = samk
+
+                if eig_arr is None:
+                    raise RuntimeError("No eigenvalues collected in non-memmap mp mode")
+                self.result["eig"] = eig_arr
+                self.result["vec"] = vec_arr if want_vec else None
+                if want_hamk and hamk_list is not None and samk_list is not None:
+                    self.result["hamk"] = hamk_list
+                    self.result["samk"] = samk_list
+                else:
+                    self.result.pop("hamk", None)
+                    self.result.pop("samk", None)
+        else:
+            if num_processes == 1:
+                # Avoid joblib/loky overhead (and extra helper processes) for the common MPI-per-kpoint case.
+                results = [
+                    _joblib_worker(i, kpoint)
+                    for i, kpoint in tqdm(zip(kpoint_indices, kpoints), total=len(kpoints))
+                ]
+            else:
+                results = Parallel(n_jobs=num_processes, backend=parallel_backend)(
+                    delayed(_joblib_worker)(i, kpoint)
+                    for i, kpoint in tqdm(zip(kpoint_indices, kpoints), total=len(kpoints))
+                )
+
+            if not use_memmap:
+                eig, vec, hamk, samk = zip(*results)
+                self.result["eig"] = np.array(eig)
+                self.result["vec"] = np.array(vec) if getattr(self.config, "eig_vec_cal", False) else None
+                if getattr(self.config, "hamk_save", False):
+                    self.result["hamk"] = hamk
+                    self.result["samk"] = samk
+                else:
+                    self.result.pop("hamk", None)
+                    self.result.pop("samk", None)
 
         end_time = time.time()
         print(f"Running time: {end_time - start_time:.2f} seconds")
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         print(f"Current Time: {current_time}")
+        if use_memmap:
+            try:
+                self.result.get("eig").flush()
+            except Exception:
+                pass
+            try:
+                if self.result.get("vec") is not None:
+                    self.result.get("vec").flush()
+            except Exception:
+                pass
 
     def generate_indices(self, num_gn_all, num_Te, num_Mo, orbs_num):
         """Generate indices for spin up/down components"""

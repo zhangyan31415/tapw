@@ -107,12 +107,32 @@ class ComputeConfig:
     efermi: float = -0.17
     n_g: int = 6
     num_processes: int = 50
+    blas_threads: int = 1  # BLAS/OpenMP threads per worker (prevents oversubscription)
+    parallel_impl: str = "joblib"  # "joblib" or "mp"
+    parallel_backend: str = "loky"  # joblib backend: "loky" (spawn) or "multiprocessing" (fork on Linux)
+    vec_store: str = "memory"  # "memory" or "memmap" (recommended for large k-mesh + wavefunctions)
+    memmap_dir: Optional[str] = None  # If set, store memmap outputs here; otherwise use output path
+    kpoint_chunk_id: int = 0  # For job-array sharding: 0-based chunk index
+    kpoint_chunk_count: int = 1  # For job-array sharding: total number of chunks
+    fast_getk: bool = True  # Faster CSR build in Getk_super_gauge_sparse (recommended)
+    use_sparse_dot_mkl: bool = False  # Use sparse_dot_mkl for g@H@g^H (can help or hurt depending on sizes/threads)
+    eigensolver: str = "scipy"  # non-TAPW generalized solver: "scipy" or "slepc" (SLEPc tuning is internal)
+    slepc_eps_type: str = "krylovschur"  # e.g. "krylovschur", "jd", "lapack" (small problems)
+    slepc_st_type: str = "sinvert"  # spectral transform: "sinvert" is typical for interior eigenvalues
+    slepc_ksp_type: str = "preonly"  # linear solver for ST; "preonly" + "lu" is robust but memory-heavy
+    slepc_pc_type: str = "lu"  # preconditioner: "lu" / "ilu" / "gamg" etc.
+    slepc_factor_mat_solver_type: str = ""  # e.g. "mumps", "superlu_dist"
+    slepc_tol: float = 1e-8
+    slepc_max_it: int = 5000
+    slepc_comm: str = "self"  # "self" (COMM_SELF, k-point workers) or "world" (COMM_WORLD, MPI parallel per k-point)
+    slepc_make_hermitian: bool = True  # symmetrize H(k),S(k) as (A+A^H)/2 to satisfy GHEP assumptions
+    slepc_spd_shift: float = 0.0  # optional diagonal shift added to S(k) to improve definiteness (e.g. 1e-10)
     num_bands_cal: int = 50
     num_chern: int = 40
     band_type: str = "CBM"  # Band type to analyze: "CBM" for conduction band minimum, "VBM" for valence band maximum
     gpu: bool = False
     gpu_index: List[int] = field(default_factory=lambda: [0, 1])
-    delay_time: int = 4
+    delay_time: int = 0  # seconds; stagger start a little to reduce I/O spikes (max delay is ~(workers-1)*delay_time)
     hamk_save: bool = False
     TAPW: bool = True
     eigsh_cal: bool = True
@@ -129,7 +149,69 @@ class ComputeConfig:
     zero_potential_layers: Optional[List[int]] = None  # 选择的层数（用于确定零势能面）
     Inner_symmetrical_Electric_Field: bool = False  # 是否加内对称电场
     orthogonal_basis: bool = False  # 是否使用正交基底，正交时S矩阵可以省略
+
+    def validate(self) -> None:
+        """Validate runtime-related options that may be overridden after YAML load."""
+
+        allowed_parallel_impl = {"joblib", "mp"}
+        if self.parallel_impl not in allowed_parallel_impl:
+            raise ValueError(
+                f"Invalid parallel_impl={self.parallel_impl!r}. Must be one of {sorted(allowed_parallel_impl)}"
+            )
+        allowed_backend = {"loky", "multiprocessing"}
+        if self.parallel_backend not in allowed_backend:
+            raise ValueError(
+                f"Invalid parallel_backend={self.parallel_backend!r}. Must be one of {sorted(allowed_backend)}"
+            )
+        allowed_vec_store = {"memory", "memmap"}
+        if self.vec_store not in allowed_vec_store:
+            raise ValueError(
+                f"Invalid vec_store={self.vec_store!r}. Must be one of {sorted(allowed_vec_store)}"
+            )
+        if self.kpoint_chunk_count < 1:
+            raise ValueError("kpoint_chunk_count must be >= 1")
+        if not (0 <= self.kpoint_chunk_id < self.kpoint_chunk_count):
+            raise ValueError(
+                f"kpoint_chunk_id must be in [0, {self.kpoint_chunk_count - 1}], got {self.kpoint_chunk_id}"
+            )
+        if self.num_processes < 1:
+            raise ValueError("num_processes must be >= 1")
+        if self.blas_threads < 1:
+            raise ValueError("blas_threads must be >= 1")
+
+        allowed_eigensolver = {"scipy", "slepc"}
+        if self.eigensolver not in allowed_eigensolver:
+            raise ValueError(
+                f"Invalid eigensolver={self.eigensolver!r}. Must be one of {sorted(allowed_eigensolver)}"
+            )
+        if self.eigensolver == "slepc":
+            allowed_slepc_comm = {"self", "world"}
+            if self.slepc_comm not in allowed_slepc_comm:
+                raise ValueError(
+                    f"Invalid slepc_comm={self.slepc_comm!r}. Must be one of {sorted(allowed_slepc_comm)}"
+                )
+
+            # SLEPc is MPI-based; mixing it with forked Python workers is unsafe.
+            # We only support joblib+loky (spawn) for now.
+            if self.parallel_impl != "joblib" or self.parallel_backend != "loky":
+                raise ValueError(
+                    "eigensolver='slepc' requires parallel_impl='joblib' and parallel_backend='loky' "
+                    "(spawn). Do not use multiprocessing/fork with MPI libraries."
+                )
+            if self.eig_vec_cal:
+                raise ValueError("eigensolver='slepc' currently supports eig_vec_cal=false only.")
+
+            if self.slepc_comm == "world":
+                # In COMM_WORLD mode we expect the user to launch with MPI (srun/mpiexec -n N).
+                # Do not also spawn local workers or do k-point chunking; it can deadlock or duplicate work.
+                if self.num_processes != 1:
+                    raise ValueError("slepc_comm='world' requires num_processes=1 (no k-point multiprocessing).")
+                if self.kpoint_chunk_count != 1 or self.kpoint_chunk_id != 0:
+                    raise ValueError("slepc_comm='world' requires kpoint_chunk_count=1 and kpoint_chunk_id=0.")
+
     def __post_init__(self):
+        self.validate()
+
         # Valley mapping
         valley_flag = {
             1: "K1", 2: "K2",

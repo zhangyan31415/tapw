@@ -47,7 +47,16 @@ compute:
   n_g: 3                  # Harmonic of G vectors
   
   # Band structure calculation parameters
-  num_processes: 61       # Number of parallel processes
+  num_processes: 21       # Number of k-point worker processes
+  blas_threads: 1         # BLAS/OpenMP threads per worker; increase carefully to avoid oversubscription
+  parallel_impl: "joblib" # "joblib" or "mp"; SLEPc currently requires joblib
+  parallel_backend: "loky" # only used when parallel_impl="joblib"; SLEPc currently requires "loky"
+  vec_store: "memory"     # "memory" or "memmap"; memmap helps large eig_vec_cal runs
+  memmap_dir: null        # optional; default is output_dir
+  kpoint_chunk_id: 0      # job-array shard id (0-based)
+  kpoint_chunk_count: 1   # job-array shard count
+  fast_getk: true         # faster sparse build for H(k)/S(k)
+  use_sparse_dot_mkl: false # optional MKL sparse GEMM acceleration for g@H@g^H
   num_bands_cal: 200      # Number of bands to calculate
   num_chern: 40          # Number of k-points for Chern number calculation (grid size will be num_chern x num_chern)
   
@@ -62,7 +71,8 @@ compute:
   eigsh_cal: true       # Use eigsh for eigenvalue calculation
   C3_H: false           # Apply C3 symmetry to Hamiltonian
   ge: false             # Use generalized eigenvalue solver
-  eig_vec_cal: false     # Calculate eigenvectors 
+  eigensolver: "scipy"  # "scipy" or "slepc"; SLEPc currently requires joblib+loky and eig_vec_cal=false
+  eig_vec_cal: true     # Calculate eigenvectors 
 
   # Electric field parameters
   Electric_field_in_eVpA: 0.00  # Electric field strength in eV/Å
