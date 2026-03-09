@@ -12,6 +12,9 @@ import time
 import os
 import sys
 import multiprocessing as mp
+import shutil
+import tempfile
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -62,6 +65,90 @@ _NOTAPW_SLEPC_FACTOR_CANDIDATES = (
 _NOTAPW_SLEPC_SPD_SHIFT = 1.0e-10
 _NOTAPW_SLEPC_TOL = 1.0e-8
 _NOTAPW_SLEPC_MAX_IT = 5000
+
+
+def _progress_interval_s() -> float:
+    value = os.environ.get("TAPW_PROGRESS_INTERVAL_S", "").strip()
+    try:
+        return max(float(value), 5.0) if value else 60.0
+    except Exception:
+        return 60.0
+
+
+def _progress_state_path(progress_dir: str, index: int) -> str:
+    return os.path.join(progress_dir, f"{int(index):06d}.state")
+
+
+def _write_progress_state(progress_dir: str | None, index: int, stage: str) -> None:
+    if not progress_dir:
+        return
+    path = _progress_state_path(progress_dir, index)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="ascii") as f:
+        f.write(stage)
+    os.replace(tmp_path, path)
+
+
+def _read_progress_counts(progress_dir: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    try:
+        entries = list(os.scandir(progress_dir))
+    except FileNotFoundError:
+        return counts
+
+    for entry in entries:
+        if not entry.is_file() or not entry.name.endswith(".state"):
+            continue
+        try:
+            with open(entry.path, "r", encoding="ascii") as f:
+                stage = f.read().strip() or "unknown"
+        except OSError:
+            continue
+        counts[stage] = counts.get(stage, 0) + 1
+    return counts
+
+
+def _format_progress_line(total: int, counts: dict[str, int], start_time: float) -> str:
+    counts = dict(counts)
+    done = int(counts.pop("done", 0))
+    error = int(counts.pop("error", 0))
+    active_parts = [f"{stage}={count}" for stage, count in sorted(counts.items()) if count > 0]
+    elapsed_min = (time.time() - start_time) / 60.0
+    msg = f"[progress] done={done}/{total}"
+    if error:
+        msg += f" error={error}"
+    if active_parts:
+        msg += " | " + " ".join(active_parts)
+    msg += f" | elapsed={elapsed_min:.1f}m"
+    return msg
+
+
+@contextmanager
+def _progress_reporter(total: int, progress_dir: str):
+    stop_event = threading.Event()
+    start_time = time.time()
+    interval_s = _progress_interval_s()
+    last_line = {"value": None}
+
+    def _emit(force: bool = False) -> None:
+        line = _format_progress_line(total, _read_progress_counts(progress_dir), start_time)
+        if force or line != last_line["value"]:
+            tqdm.write(line)
+            last_line["value"] = line
+
+    def _worker() -> None:
+        while not stop_event.wait(interval_s):
+            _emit()
+
+    _emit(force=True)
+    thread = threading.Thread(target=_worker, name="tapw-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=1.0)
+        _emit(force=True)
 
 
 @contextmanager
@@ -494,12 +581,15 @@ def _mp_kpoint_worker(args: tuple[int, np.ndarray]) -> tuple[int, bool, str | No
             if getattr(cfg, "eig_vec_cal", False) and vec_path is not None and vec is not None:
                 vec_mm = _get_memmap(str(vec_path))
                 vec_mm[i, :, : vec.shape[1]] = vec
+            calc._set_progress_stage(i, "done")
             return i, True, None, None
 
         # In non-memmap mode, return the results to the parent so it can assemble
         # self.result["eig"]/["vec"] in memory (original behavior).
+        calc._set_progress_stage(i, "done")
         return i, True, None, (eig, vec, hamk, samk)
     except Exception as e:  # pragma: no cover
+        calc._set_progress_stage(i, "error")
         return i, False, str(e), None
 
 class TAPW_parameters:
@@ -1365,6 +1455,7 @@ class BandStructureCalculator:
         self.kpath_config = kpath_config
         
         self.result = {}
+        self._progress_dir: str | None = None
         
         # Validate valley configuration
         if not hasattr(self.config, 'valley') or self.config.valley not in self.VALLEY_MAP:
@@ -1384,6 +1475,9 @@ class BandStructureCalculator:
             
         if self.config.gpu and cp is None:
             raise ImportError("CuPy is not installed. Please install CuPy to use GPU acceleration.")
+
+    def _set_progress_stage(self, index: int, stage: str) -> None:
+        _write_progress_state(self._progress_dir, index, stage)
 
     def _ensure_sorted_wann_cache(self) -> None:
         if self._sorted_wann is not None and self._num_wann is not None:
@@ -2059,6 +2153,7 @@ class BandStructureCalculator:
     def calculate_band_01(self, kpoints, i):
         """Calculate band structure for a single k-point"""
         if self.config.TAPW:
+            self._set_progress_stage(i, "build_hs")
             if self.config.C3_H:
                 hamk, samk = self.Getk_super_gauge_sparse_symm_final_HS(
                     self.hr_supercell, self.sr_supercell, 
@@ -2071,6 +2166,7 @@ class BandStructureCalculator:
                     self.config.gpu_index[i % self.config.gpu_num]
                 )
             # 正交基底下直接对角化Hk
+            self._set_progress_stage(i, "solve")
             if self.config.orthogonal_basis:
                 if self.config.eigsh_cal:
                     w = eigsh(hamk, k=self.config.num_bands_cal, sigma=self.config.efermi, 
@@ -2096,8 +2192,14 @@ class BandStructureCalculator:
                         w = scipy.linalg.eigh(a, eigvals_only=not self.config.eig_vec_cal, check_finite=False)
         else:
             if self.config.ge:
+                self._set_progress_stage(i, "build_h")
                 hamk = self.Getk_super_gauge_sparse(self.hr_supercell, kpoints[:3], type="H")
-                samk = None if self.config.orthogonal_basis else self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3], type="S")
+                if self.config.orthogonal_basis:
+                    samk = None
+                else:
+                    self._set_progress_stage(i, "build_s")
+                    samk = self.Getk_super_gauge_sparse(self.sr_supercell, kpoints[:3], type="S")
+                self._set_progress_stage(i, "solve")
                 w = _solve_notapw_generalized_eigs(hamk, samk, self.config)
             else:
                 raise ValueError("Not implemented! Recommend to use generalized eigenvalue solver (ge=true).")
@@ -2114,6 +2216,7 @@ class BandStructureCalculator:
         if not self.config.hamk_save:
             hamk = None
             samk = None
+        self._set_progress_stage(i, "post")
         return eig, vec, hamk, samk
 
     @timing_decorator_factory(process_id=0)
@@ -2151,6 +2254,11 @@ class BandStructureCalculator:
         kpoint_indices = [int(i) for i in kpoint_indices]
 
         use_memmap = (vec_store == "memmap") or (int(getattr(self.config, "kpoint_chunk_count", 1)) > 1)
+        progress_root = out_dir or os.getcwd()
+        progress_dir = tempfile.mkdtemp(prefix=f"tapw_progress_{self.valley_flag}_", dir=progress_root)
+        self._progress_dir = progress_dir
+        for i in kpoint_indices:
+            _write_progress_state(progress_dir, i, "queued")
 
         eig_path = None
         vec_path = None
@@ -2181,127 +2289,138 @@ class BandStructureCalculator:
             self.result["vec"] = open_memmap(vec_path, mode="r+") if vec_path is not None else None
 
         def _joblib_worker(i, kpoint):
-            _maybe_pin_current_worker(blas_threads, num_processes)
-            _set_thread_limits(blas_threads)
-            delay_time = getattr(self.config, "delay_time", 0)
-            if delay_time:
-                time.sleep((i % max(num_processes, 1)) * delay_time)
-            eig, vec, hamk, samk = self.calculate_band_01(kpoint, i)
+            try:
+                _maybe_pin_current_worker(blas_threads, num_processes)
+                _set_thread_limits(blas_threads)
+                delay_time = getattr(self.config, "delay_time", 0)
+                if delay_time:
+                    time.sleep((i % max(num_processes, 1)) * delay_time)
+                eig, vec, hamk, samk = self.calculate_band_01(kpoint, i)
 
-            if use_memmap and eig_path is not None:
-                eig_mm = _get_memmap(eig_path)
-                eig_mm[i, : eig.shape[0]] = eig
-                if getattr(self.config, "eig_vec_cal", False) and vec_path is not None and vec is not None:
-                    vec_mm = _get_memmap(vec_path)
-                    vec_mm[i, :, : vec.shape[1]] = vec
-                return i, True, None
+                if use_memmap and eig_path is not None:
+                    eig_mm = _get_memmap(eig_path)
+                    eig_mm[i, : eig.shape[0]] = eig
+                    if getattr(self.config, "eig_vec_cal", False) and vec_path is not None and vec is not None:
+                        vec_mm = _get_memmap(vec_path)
+                        vec_mm[i, :, : vec.shape[1]] = vec
+                    self._set_progress_stage(i, "done")
+                    return i, True, None
 
-            return eig, vec, hamk, samk
+                self._set_progress_stage(i, "done")
+                return eig, vec, hamk, samk
+            except Exception:
+                self._set_progress_stage(i, "error")
+                raise
 
-        if parallel_impl == "mp":
-            # Fork-based pool avoids repeatedly pickling a huge calculator object.
-            ctx = mp.get_context("fork")
-            _MP_STATE.clear()
-            _MP_STATE.update(
-                {
-                    "calc": self,
-                    "cfg": self.config,
-                    "eig_path": eig_path,
-                    "vec_path": vec_path,
-                    "use_memmap": use_memmap,
-                }
-            )
-            with ctx.Pool(
-                processes=num_processes,
-                initializer=_mp_worker_init,
-                initargs=(blas_threads,),
-            ) as pool:
-                statuses = list(
-                    tqdm(
-                        pool.imap_unordered(_mp_kpoint_worker, zip(kpoint_indices, kpoints)),
-                        total=len(kpoints),
-                        desc="k-points",
-                        unit="kpt",
-                        mininterval=5.0,
-                        dynamic_ncols=True,
+        try:
+            with _progress_reporter(total=len(kpoints), progress_dir=progress_dir):
+                if parallel_impl == "mp":
+                    # Fork-based pool avoids repeatedly pickling a huge calculator object.
+                    ctx = mp.get_context("fork")
+                    _MP_STATE.clear()
+                    _MP_STATE.update(
+                        {
+                            "calc": self,
+                            "cfg": self.config,
+                            "eig_path": eig_path,
+                            "vec_path": vec_path,
+                            "use_memmap": use_memmap,
+                        }
                     )
-                )
-            failed = [(i, err) for (i, ok, err, _) in statuses if not ok]
-            if failed:
-                raise RuntimeError(f"{len(failed)} k-points failed, first: {failed[0]}")
-            if not use_memmap:
-                # Assemble results in memory, matching the original (joblib) behavior.
-                eig_arr = None
-                vec_arr = None
-                want_vec = bool(getattr(self.config, "eig_vec_cal", False))
-                want_hamk = bool(getattr(self.config, "hamk_save", False))
-                hamk_list = [None] * nk_total if want_hamk else None
-                samk_list = [None] * nk_total if want_hamk else None
+                    with ctx.Pool(
+                        processes=num_processes,
+                        initializer=_mp_worker_init,
+                        initargs=(blas_threads,),
+                    ) as pool:
+                        statuses = list(
+                            tqdm(
+                                pool.imap_unordered(_mp_kpoint_worker, zip(kpoint_indices, kpoints)),
+                                total=len(kpoints),
+                                desc="k-points",
+                                unit="kpt",
+                                mininterval=5.0,
+                                dynamic_ncols=True,
+                            )
+                        )
+                    failed = [(i, err) for (i, ok, err, _) in statuses if not ok]
+                    if failed:
+                        raise RuntimeError(f"{len(failed)} k-points failed, first: {failed[0]}")
+                    if not use_memmap:
+                        # Assemble results in memory, matching the original (joblib) behavior.
+                        eig_arr = None
+                        vec_arr = None
+                        want_vec = bool(getattr(self.config, "eig_vec_cal", False))
+                        want_hamk = bool(getattr(self.config, "hamk_save", False))
+                        hamk_list = [None] * nk_total if want_hamk else None
+                        samk_list = [None] * nk_total if want_hamk else None
 
-                for (i, ok, err, payload) in statuses:
-                    if not ok:
-                        raise RuntimeError(err or f"k-point {i} failed")
-                    if payload is None:
-                        raise RuntimeError(f"Missing payload for k-point {i} in non-memmap mp mode")
-                    eig, vec, hamk, samk = payload
-                    eig = np.asarray(eig)
-                    if eig_arr is None:
-                        eig_arr = np.empty((nk_total, eig.shape[0]), dtype=eig.dtype)
-                    eig_arr[i, : eig.shape[0]] = eig
+                        for (i, ok, err, payload) in statuses:
+                            if not ok:
+                                raise RuntimeError(err or f"k-point {i} failed")
+                            if payload is None:
+                                raise RuntimeError(f"Missing payload for k-point {i} in non-memmap mp mode")
+                            eig, vec, hamk, samk = payload
+                            eig = np.asarray(eig)
+                            if eig_arr is None:
+                                eig_arr = np.empty((nk_total, eig.shape[0]), dtype=eig.dtype)
+                            eig_arr[i, : eig.shape[0]] = eig
 
-                    if want_vec:
-                        if vec is None:
-                            raise RuntimeError(f"eig_vec_cal=True but vec is None for k-point {i}")
-                        vec = np.asarray(vec)
-                        if vec_arr is None:
-                            vec_arr = np.empty((nk_total, vec.shape[0], vec.shape[1]), dtype=vec.dtype)
-                        vec_arr[i, :, : vec.shape[1]] = vec
+                            if want_vec:
+                                if vec is None:
+                                    raise RuntimeError(f"eig_vec_cal=True but vec is None for k-point {i}")
+                                vec = np.asarray(vec)
+                                if vec_arr is None:
+                                    vec_arr = np.empty((nk_total, vec.shape[0], vec.shape[1]), dtype=vec.dtype)
+                                vec_arr[i, :, : vec.shape[1]] = vec
 
-                    if want_hamk and hamk_list is not None and samk_list is not None:
-                        hamk_list[i] = hamk
-                        samk_list[i] = samk
+                            if want_hamk and hamk_list is not None and samk_list is not None:
+                                hamk_list[i] = hamk
+                                samk_list[i] = samk
 
-                if eig_arr is None:
-                    raise RuntimeError("No eigenvalues collected in non-memmap mp mode")
-                self.result["eig"] = eig_arr
-                self.result["vec"] = vec_arr if want_vec else None
-                if want_hamk and hamk_list is not None and samk_list is not None:
-                    self.result["hamk"] = hamk_list
-                    self.result["samk"] = samk_list
+                        if eig_arr is None:
+                            raise RuntimeError("No eigenvalues collected in non-memmap mp mode")
+                        self.result["eig"] = eig_arr
+                        self.result["vec"] = vec_arr if want_vec else None
+                        if want_hamk and hamk_list is not None and samk_list is not None:
+                            self.result["hamk"] = hamk_list
+                            self.result["samk"] = samk_list
+                        else:
+                            self.result.pop("hamk", None)
+                            self.result.pop("samk", None)
                 else:
-                    self.result.pop("hamk", None)
-                    self.result.pop("samk", None)
-        else:
-            if num_processes == 1:
-                # Avoid joblib/loky overhead (and extra helper processes) for the common MPI-per-kpoint case.
-                results = [
-                    _joblib_worker(i, kpoint)
-                    for i, kpoint in tqdm(
-                        zip(kpoint_indices, kpoints),
-                        total=len(kpoints),
-                        desc="k-points",
-                        unit="kpt",
-                        mininterval=5.0,
-                        dynamic_ncols=True,
-                    )
-                ]
-            else:
-                with _tqdm_joblib(total=len(kpoints), desc="k-points"):
-                    results = Parallel(n_jobs=num_processes, backend=parallel_backend)(
-                        delayed(_joblib_worker)(i, kpoint)
-                        for i, kpoint in zip(kpoint_indices, kpoints)
-                    )
+                    if num_processes == 1:
+                        # Avoid joblib/loky overhead (and extra helper processes) for the common MPI-per-kpoint case.
+                        results = [
+                            _joblib_worker(i, kpoint)
+                            for i, kpoint in tqdm(
+                                zip(kpoint_indices, kpoints),
+                                total=len(kpoints),
+                                desc="k-points",
+                                unit="kpt",
+                                mininterval=5.0,
+                                dynamic_ncols=True,
+                            )
+                        ]
+                    else:
+                        with _tqdm_joblib(total=len(kpoints), desc="k-points"):
+                            results = Parallel(n_jobs=num_processes, backend=parallel_backend)(
+                                delayed(_joblib_worker)(i, kpoint)
+                                for i, kpoint in zip(kpoint_indices, kpoints)
+                            )
 
-            if not use_memmap:
-                eig, vec, hamk, samk = zip(*results)
-                self.result["eig"] = np.array(eig)
-                self.result["vec"] = np.array(vec) if getattr(self.config, "eig_vec_cal", False) else None
-                if getattr(self.config, "hamk_save", False):
-                    self.result["hamk"] = hamk
-                    self.result["samk"] = samk
-                else:
-                    self.result.pop("hamk", None)
-                    self.result.pop("samk", None)
+                    if not use_memmap:
+                        eig, vec, hamk, samk = zip(*results)
+                        self.result["eig"] = np.array(eig)
+                        self.result["vec"] = np.array(vec) if getattr(self.config, "eig_vec_cal", False) else None
+                        if getattr(self.config, "hamk_save", False):
+                            self.result["hamk"] = hamk
+                            self.result["samk"] = samk
+                        else:
+                            self.result.pop("hamk", None)
+                            self.result.pop("samk", None)
+        finally:
+            self._progress_dir = None
+            shutil.rmtree(progress_dir, ignore_errors=True)
 
         end_time = time.time()
         print(f"Running time: {end_time - start_time:.2f} seconds")
