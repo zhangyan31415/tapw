@@ -12,9 +12,6 @@ import time
 import os
 import sys
 import multiprocessing as mp
-import shutil
-import tempfile
-import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -67,88 +64,14 @@ _NOTAPW_SLEPC_TOL = 1.0e-8
 _NOTAPW_SLEPC_MAX_IT = 5000
 
 
-def _progress_interval_s() -> float:
-    value = os.environ.get("TAPW_PROGRESS_INTERVAL_S", "").strip()
-    try:
-        return max(float(value), 5.0) if value else 60.0
-    except Exception:
-        return 60.0
-
-
-def _progress_state_path(progress_dir: str, index: int) -> str:
-    return os.path.join(progress_dir, f"{int(index):06d}.state")
-
-
 def _write_progress_state(progress_dir: str | None, index: int, stage: str) -> None:
-    if not progress_dir:
-        return
-    path = _progress_state_path(progress_dir, index)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="ascii") as f:
-        f.write(stage)
-    os.replace(tmp_path, path)
-
-
-def _read_progress_counts(progress_dir: str) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    try:
-        entries = list(os.scandir(progress_dir))
-    except FileNotFoundError:
-        return counts
-
-    for entry in entries:
-        if not entry.is_file() or not entry.name.endswith(".state"):
-            continue
-        try:
-            with open(entry.path, "r", encoding="ascii") as f:
-                stage = f.read().strip() or "unknown"
-        except OSError:
-            continue
-        counts[stage] = counts.get(stage, 0) + 1
-    return counts
-
-
-def _format_progress_line(total: int, counts: dict[str, int], start_time: float) -> str:
-    counts = dict(counts)
-    done = int(counts.pop("done", 0))
-    error = int(counts.pop("error", 0))
-    active_parts = [f"{stage}={count}" for stage, count in sorted(counts.items()) if count > 0]
-    elapsed_min = (time.time() - start_time) / 60.0
-    msg = f"[progress] done={done}/{total}"
-    if error:
-        msg += f" error={error}"
-    if active_parts:
-        msg += " | " + " ".join(active_parts)
-    msg += f" | elapsed={elapsed_min:.1f}m"
-    return msg
+    # Progress state files were removed to avoid littering result directories.
+    return
 
 
 @contextmanager
-def _progress_reporter(total: int, progress_dir: str):
-    stop_event = threading.Event()
-    start_time = time.time()
-    interval_s = _progress_interval_s()
-    last_line = {"value": None}
-
-    def _emit(force: bool = False) -> None:
-        line = _format_progress_line(total, _read_progress_counts(progress_dir), start_time)
-        if force or line != last_line["value"]:
-            tqdm.write(line)
-            last_line["value"] = line
-
-    def _worker() -> None:
-        while not stop_event.wait(interval_s):
-            _emit()
-
-    _emit(force=True)
-    thread = threading.Thread(target=_worker, name="tapw-progress", daemon=True)
-    thread.start()
-    try:
-        yield
-    finally:
-        stop_event.set()
-        thread.join(timeout=1.0)
-        _emit(force=True)
+def _progress_reporter(total: int):
+    yield
 
 
 @contextmanager
@@ -2254,11 +2177,7 @@ class BandStructureCalculator:
         kpoint_indices = [int(i) for i in kpoint_indices]
 
         use_memmap = (vec_store == "memmap") or (int(getattr(self.config, "kpoint_chunk_count", 1)) > 1)
-        progress_root = out_dir or os.getcwd()
-        progress_dir = tempfile.mkdtemp(prefix=f"tapw_progress_{self.valley_flag}_", dir=progress_root)
-        self._progress_dir = progress_dir
-        for i in kpoint_indices:
-            _write_progress_state(progress_dir, i, "queued")
+        self._progress_dir = None
 
         eig_path = None
         vec_path = None
@@ -2312,8 +2231,7 @@ class BandStructureCalculator:
                 self._set_progress_stage(i, "error")
                 raise
 
-        try:
-            with _progress_reporter(total=len(kpoints), progress_dir=progress_dir):
+        with _progress_reporter(total=len(kpoints)):
                 if parallel_impl == "mp":
                     # Fork-based pool avoids repeatedly pickling a huge calculator object.
                     ctx = mp.get_context("fork")
@@ -2418,9 +2336,7 @@ class BandStructureCalculator:
                         else:
                             self.result.pop("hamk", None)
                             self.result.pop("samk", None)
-        finally:
-            self._progress_dir = None
-            shutil.rmtree(progress_dir, ignore_errors=True)
+        self._progress_dir = None
 
         end_time = time.time()
         print(f"Running time: {end_time - start_time:.2f} seconds")
