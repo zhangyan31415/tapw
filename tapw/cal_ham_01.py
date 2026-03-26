@@ -1427,24 +1427,27 @@ class BandStructureCalculator:
         else:
             self._ef_onsite_orb = None
 
-    def generate_kmesh(self, num_k):
-        """Generate a uniform k-point mesh for Chern number calculation
-        
-        Args:
-            num_k: Number of k-points in each direction
-            
-        Returns:
-            numpy.ndarray: Array of k-points in the first Brillouin zone
+    def generate_kmesh(self, num_k1, num_k2=None):
+        """Generate a uniform fractional kappa-grid for Chern calculations.
+
+        The returned points follow NumPy row-major flatten order with
+        `indexing='ij'`, so reshaping downstream as `(num_k1, num_k2, ...)`
+        preserves the stored order.
         """
-        
-        # Generate uniform mesh
-        kx = np.linspace(0, 1, num_k, endpoint=True)
-        ky = np.linspace(0, 1, num_k, endpoint=True)
-        kx = np.linspace(-0.5, 0.5, num_k, endpoint=True)
-        ky = np.linspace(-0.5, 0.5, num_k, endpoint=True)
-        K_mesh = np.meshgrid(kx, ky)
-        kpoints = np.array(K_mesh).reshape(2, -1).T
-        kpoints = np.hstack((kpoints, np.zeros((kpoints.shape[0], 1))))
+        if num_k2 is None:
+            num_k2 = num_k1
+
+        kappa1 = np.linspace(-0.5, 0.5, int(num_k1), endpoint=True)
+        kappa2 = np.linspace(-0.5, 0.5, int(num_k2), endpoint=True)
+        kappa1_mesh, kappa2_mesh = np.meshgrid(kappa1, kappa2, indexing='ij')
+        kpoints = np.stack(
+            (
+                kappa1_mesh,
+                kappa2_mesh,
+                np.zeros_like(kappa1_mesh),
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
         return kpoints
 
     def find_first_above_energy(self, energies, E):
@@ -1560,8 +1563,8 @@ class BandStructureCalculator:
         # Suffix used in filenames (also reused by memmap outputs)
         mode = getattr(self.config, "mode", None)
         suffix = "_2d" if mode == "chern" else ""
-        if mode == "chern" and hasattr(self.config, "num_chern"):
-            suffix += f"_{self.config.num_chern}"
+        if mode == "chern" and hasattr(self.config, "get_chern_grid_suffix"):
+            suffix = self.config.get_chern_grid_suffix()
 
         # Optional k-point chunking for job arrays / multi-node runs.
         kpoints_all = kpoints
@@ -1733,7 +1736,8 @@ class BandStructureCalculator:
             path: Output path for results
         """
         # Generate uniform k-point mesh
-        kpoints = self.generate_kmesh(self.config.num_chern)
+        num_k1, num_k2 = self.config.get_chern_grid_shape()
+        kpoints = self.generate_kmesh(num_k1, num_k2)
         print("kpoints shape = ", kpoints.shape)
         print("kpoints = ", kpoints)
         
@@ -1983,8 +1987,14 @@ class BandStructureCalculator:
             L = scipy.linalg.cholesky(samk, lower=True, check_finite=False)
             # A = L^{-1} H L^{-H}
             X = scipy.linalg.solve_triangular(L, hamk, lower=True, trans='N', check_finite=False)
-            A_T = scipy.linalg.solve_triangular(L.conj().T, X.T, lower=False, trans='N', check_finite=False)
-            hamk_new = A_T.T
+            # For complex matrices the right factor must be L^{-H}, not a plain transpose-based solve.
+            hamk_new = scipy.linalg.solve_triangular(
+                L,
+                X.conj().T,
+                lower=True,
+                trans='N',
+                check_finite=False,
+            ).conj().T
             # Numerical symmetrization (should be Hermitian).
             hamk_new = (hamk_new + hamk_new.conj().T) / 2
             return hamk_new

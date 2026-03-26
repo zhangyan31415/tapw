@@ -5,6 +5,8 @@ import sys
 import time
 from pathlib import Path
 import os
+from typing import Tuple
+
 from .config import Config
 from .cal_ham_01 import BandStructureCalculator
 from .read_pos_01 import OpenMXFile, StructureProcessorSpglib
@@ -12,7 +14,7 @@ from .read_kpath_01 import KPathGenerator
 from .read_hr_01 import HrSparseHandler
 from .tapw_slab import TAPWSlab
 
-def _mpi_world_rank_size() -> tuple[int, int]:
+def _mpi_world_rank_size() -> Tuple[int, int]:
     # Best-effort: works both under mpiexec/srun and in normal (non-MPI) runs.
     try:
         from mpi4py import MPI  # type: ignore
@@ -54,6 +56,10 @@ def parse_args():
                        help='Harmonic of G vectors (overrides config file)')
     parser.add_argument('--num_chern', type=int,
                        help='Number of k-points for Chern number calculation (overrides config file)')
+    parser.add_argument('--num_k1', type=int,
+                       help='Number of fractional-grid points along kappa1 for Chern mode (overrides config file)')
+    parser.add_argument('--num_k2', type=int,
+                       help='Number of fractional-grid points along kappa2 for Chern mode (overrides config file)')
     parser.add_argument('--num_processes', type=int,
                        help='Number of processes (overrides config file)')
     parser.add_argument('--blas_threads', type=int,
@@ -94,6 +100,10 @@ def main():
         config.compute.n_g = args.n_g
     if args.num_chern is not None:
         config.compute.num_chern = args.num_chern
+    if args.num_k1 is not None:
+        config.compute.num_k1 = args.num_k1
+    if args.num_k2 is not None:
+        config.compute.num_k2 = args.num_k2
     if args.num_processes is not None:
         config.compute.num_processes = args.num_processes
     if args.blas_threads is not None:
@@ -141,7 +151,8 @@ def main():
     logger.info(f"Calculation mode: {config.compute.mode}")
     logger.info(f"Harmonic of G vectors: {config.compute.n_g}")
     if config.compute.mode == "chern":
-        logger.info(f"Number of k-points for Chern number calculation: {config.compute.num_chern}x{config.compute.num_chern}")
+        num_k1, num_k2 = config.compute.get_chern_grid_shape()
+        logger.info(f"Number of k-points for Chern number calculation: {num_k1}x{num_k2}")
         logger.info(f"Number of processes: {config.compute.num_processes}")
     try:
         # Initialize structure

@@ -1,8 +1,45 @@
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Sequence, Tuple, Union
 import os
 import yaml
 from pathlib import Path
+
+
+_GridLike = Union[int, Sequence[int]]
+
+
+def _coerce_legacy_num_chern(num_chern: _GridLike) -> Tuple[int, int]:
+    """Normalize legacy `num_chern` input to an explicit `(num_k1, num_k2)` pair."""
+    if isinstance(num_chern, (list, tuple)):
+        if len(num_chern) != 2:
+            raise ValueError("num_chern as a list/tuple must contain exactly two integers, e.g. [30, 50]")
+        return int(num_chern[0]), int(num_chern[1])
+    return int(num_chern), int(num_chern)
+
+
+def resolve_chern_grid_shape(num_chern: _GridLike, num_k1: Optional[int] = None, num_k2: Optional[int] = None) -> tuple:
+    """Resolve the fractional Chern/Wilson-loop vertex grid dimensions.
+
+    `num_chern` accepts the legacy scalar square-grid form (`40`) and also a
+    two-entry list/tuple (`[30, 50]`). Explicit `num_k1`/`num_k2` still take
+    precedence when present.
+    """
+    legacy_k1, legacy_k2 = _coerce_legacy_num_chern(num_chern)
+    k1 = int(num_k1 if num_k1 is not None else legacy_k1)
+    k2 = int(num_k2 if num_k2 is not None else legacy_k2)
+    if k1 < 2 or k2 < 2:
+        raise ValueError("Chern/Wilson-loop grids require num_k1 >= 2 and num_k2 >= 2")
+    return k1, k2
+
+
+def format_chern_grid_suffix(num_k1: int, num_k2: int) -> str:
+    """Return a stable output suffix for a Chern-mode grid."""
+    num_k1 = int(num_k1)
+    num_k2 = int(num_k2)
+    if num_k1 == num_k2:
+        return "_2d_{0}".format(num_k1)
+    return "_2d_{0}x{1}".format(num_k1, num_k2)
+
 
 @dataclass
 class TwistConfig:
@@ -128,7 +165,9 @@ class ComputeConfig:
     slepc_make_hermitian: bool = True  # symmetrize H(k),S(k) as (A+A^H)/2 to satisfy GHEP assumptions
     slepc_spd_shift: float = 0.0  # optional diagonal shift added to S(k) to improve definiteness (e.g. 1e-10)
     num_bands_cal: int = 50
-    num_chern: int = 40
+    num_chern: _GridLike = 40  # Legacy scalar square-grid size, or a 2-entry list like [num_k1, num_k2].
+    num_k1: Optional[int] = None  # Fractional reciprocal-grid points along kappa1 (falls back to num_chern).
+    num_k2: Optional[int] = None  # Fractional reciprocal-grid points along kappa2 (falls back to num_chern).
     band_type: str = "BOTH"  # Band subset to save: "CBM", "VBM", or "BOTH"
     gpu: bool = False
     gpu_index: List[int] = field(default_factory=lambda: [0, 1])
@@ -178,36 +217,51 @@ class ComputeConfig:
             raise ValueError("num_processes must be >= 1")
         if self.blas_threads < 1:
             raise ValueError("blas_threads must be >= 1")
+        self.get_chern_grid_shape()
 
         allowed_eigensolver = {"scipy", "slepc"}
         if self.eigensolver not in allowed_eigensolver:
             raise ValueError(
                 f"Invalid eigensolver={self.eigensolver!r}. Must be one of {sorted(allowed_eigensolver)}"
             )
-        if self.eigensolver == "slepc":
-            allowed_slepc_comm = {"self", "world"}
-            if self.slepc_comm not in allowed_slepc_comm:
-                raise ValueError(
-                    f"Invalid slepc_comm={self.slepc_comm!r}. Must be one of {sorted(allowed_slepc_comm)}"
-                )
+        if not self.TAPW:
+            if self.eigensolver == "slepc":
+                allowed_slepc_comm = {"self", "world"}
+                if self.slepc_comm not in allowed_slepc_comm:
+                    raise ValueError(
+                        f"Invalid slepc_comm={self.slepc_comm!r}. Must be one of {sorted(allowed_slepc_comm)}"
+                    )
 
-            # SLEPc is MPI-based; mixing it with forked Python workers is unsafe.
-            # We only support joblib+loky (spawn) for now.
-            if self.parallel_impl != "joblib" or self.parallel_backend != "loky":
-                raise ValueError(
-                    "eigensolver='slepc' requires parallel_impl='joblib' and parallel_backend='loky' "
-                    "(spawn). Do not use multiprocessing/fork with MPI libraries."
-                )
-            if self.eig_vec_cal:
-                raise ValueError("eigensolver='slepc' currently supports eig_vec_cal=false only.")
+                # SLEPc is MPI-based; mixing it with forked Python workers is unsafe.
+                # We only support joblib+loky (spawn) for now.
+                if self.parallel_impl != "joblib" or self.parallel_backend != "loky":
+                    raise ValueError(
+                        "eigensolver='slepc' requires parallel_impl='joblib' and parallel_backend='loky' "
+                        "(spawn). Do not use multiprocessing/fork with MPI libraries."
+                    )
+                if self.eig_vec_cal:
+                    raise ValueError("eigensolver='slepc' currently supports eig_vec_cal=false only.")
 
-            if self.slepc_comm == "world":
-                # In COMM_WORLD mode we expect the user to launch with MPI (srun/mpiexec -n N).
-                # Do not also spawn local workers or do k-point chunking; it can deadlock or duplicate work.
-                if self.num_processes != 1:
-                    raise ValueError("slepc_comm='world' requires num_processes=1 (no k-point multiprocessing).")
-                if self.kpoint_chunk_count != 1 or self.kpoint_chunk_id != 0:
-                    raise ValueError("slepc_comm='world' requires kpoint_chunk_count=1 and kpoint_chunk_id=0.")
+                if self.slepc_comm == "world":
+                    # In COMM_WORLD mode we expect the user to launch with MPI (srun/mpiexec -n N).
+                    # Do not also spawn local workers or do k-point chunking; it can deadlock or duplicate work.
+                    if self.num_processes != 1:
+                        raise ValueError("slepc_comm='world' requires num_processes=1 (no k-point multiprocessing).")
+                    if self.kpoint_chunk_count != 1 or self.kpoint_chunk_id != 0:
+                        raise ValueError("slepc_comm='world' requires kpoint_chunk_count=1 and kpoint_chunk_id=0.")
+
+    def get_chern_grid_shape(self) -> tuple:
+        """Return the explicit fractional Chern-grid shape `(num_k1, num_k2)`."""
+        return resolve_chern_grid_shape(
+            num_chern=self.num_chern,
+            num_k1=self.num_k1,
+            num_k2=self.num_k2,
+        )
+
+    def get_chern_grid_suffix(self) -> str:
+        """Return the filename suffix used for Chern-mode raw/final outputs."""
+        num_k1, num_k2 = self.get_chern_grid_shape()
+        return format_chern_grid_suffix(num_k1, num_k2)
 
     def __post_init__(self):
         self.validate()
