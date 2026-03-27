@@ -2509,6 +2509,7 @@ class BandStructureCalculator:
         self._sorted_wann: np.ndarray | None = None
         self._num_wann: int | None = None
         self._ef_onsite_orb: np.ndarray | None = None
+        self._realspace_block_cache: dict[int, SimpleNamespace] = {}
         
         if self.config.TAPW:
             if self.use_M_valley_threefold_symm:
@@ -2555,6 +2556,112 @@ class BandStructureCalculator:
             self._ef_onsite_orb = ef_orb
         else:
             self._ef_onsite_orb = None
+
+    def _get_or_build_realspace_block_cache(self, hr_blocks) -> SimpleNamespace:
+        cache_key = id(hr_blocks)
+        cached = self._realspace_block_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        rows_template_parts = []
+        cols_template_parts = []
+        blocks = []
+        offset = 0
+        for rvec, values_dic in hr_blocks.items():
+            row_index = np.asarray(values_dic["row"], dtype=np.int64)
+            col_index = np.asarray(values_dic["col"], dtype=np.int64)
+            values = np.asarray(values_dic["val"], dtype=np.complex128)
+            block_nnz = int(values.shape[0])
+            rows_template_parts.append(row_index)
+            cols_template_parts.append(col_index)
+            blocks.append(
+                SimpleNamespace(
+                    row_index=row_index,
+                    col_index=col_index,
+                    values=values,
+                    rvec_cart=np.dot(rvec, self.structure.Tmat),
+                    data_slice=slice(offset, offset + block_nnz),
+                )
+            )
+            offset += block_nnz
+
+        rows_template = (
+            np.concatenate(rows_template_parts, dtype=np.int64)
+            if rows_template_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        cols_template = (
+            np.concatenate(cols_template_parts, dtype=np.int64)
+            if cols_template_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        cached = SimpleNamespace(
+            nnz_total=int(offset),
+            rows_template=rows_template,
+            cols_template=cols_template,
+            blocks=blocks,
+        )
+        self._realspace_block_cache[cache_key] = cached
+        return cached
+
+    def _build_getk_phase_context(self, k) -> SimpleNamespace:
+        kvec = self.get_kvec(k)
+        self._ensure_sorted_wann_cache()
+        sorted_wann = self._sorted_wann
+        num_wann = self._num_wann
+        if sorted_wann is None or num_wann is None:
+            raise RuntimeError("sorted_wann cache is not initialized")
+
+        phase_wann = (
+            sorted_wann[:, 0] * kvec[0]
+            + sorted_wann[:, 1] * kvec[1]
+            + sorted_wann[:, 2] * kvec[2]
+        )
+        return SimpleNamespace(
+            kvec=np.asarray(kvec, dtype=float),
+            sorted_wann=sorted_wann,
+            num_wann=int(num_wann),
+            phase_wann=phase_wann,
+        )
+
+    def _assemble_sparse_realspace_matrix(self, hr_blocks, phase_ctx, type="H"):
+        sorted_wann = phase_ctx.sorted_wann
+        num_wann = phase_ctx.num_wann
+        kvec = phase_ctx.kvec
+        phase_wann = phase_ctx.phase_wann
+
+        use_fast = bool(getattr(self.config, "fast_getk", True))
+        if use_fast:
+            block_cache = self._get_or_build_realspace_block_cache(hr_blocks)
+            data = np.empty(block_cache.nnz_total, dtype=np.complex128)
+            for block in block_cache.blocks:
+                exp_kR = np.exp(1j * np.dot(kvec, block.rvec_cart))
+                dot_mn = phase_wann[block.row_index] - phase_wann[block.col_index]
+                data[block.data_slice] = block.values * np.exp(-1j * dot_mn) * exp_kR
+            mk = scipy.sparse.coo_matrix(
+                (data, (block_cache.rows_template, block_cache.cols_template)),
+                shape=(num_wann, num_wann),
+                dtype=np.complex128,
+            ).tocsr()
+            mk.sum_duplicates()
+        else:
+            mk = scipy.sparse.csr_matrix((num_wann, num_wann), dtype=np.complex128)
+            for rvec, values_dic in hr_blocks.items():
+                row_index = np.asarray(values_dic["row"], dtype=np.int64)
+                col_index = np.asarray(values_dic["col"], dtype=np.int64)
+                val_index = np.asarray(values_dic["val"], dtype=np.complex128)
+                m_coor = sorted_wann[row_index]
+                n_coor = sorted_wann[col_index]
+                rvec_cart = np.dot(rvec, self.structure.Tmat)
+                phase_factor = np.exp(-1j * np.dot(m_coor - n_coor, kvec)) * np.exp(1j * np.dot(kvec, rvec_cart))
+                mk += scipy.sparse.csr_matrix(
+                    (val_index * phase_factor, (row_index, col_index)),
+                    shape=(num_wann, num_wann),
+                )
+
+        if type == "H" and self._ef_onsite_orb is not None:
+            mk = mk + scipy.sparse.diags(self._ef_onsite_orb, 0, shape=(num_wann, num_wann), dtype=np.float64)
+        return mk
 
     def _clone_compute_config_for_valley(self, valley: int) -> ComputeConfig:
         cfg = copy.deepcopy(self.config)
@@ -2615,18 +2722,25 @@ class BandStructureCalculator:
             return projector
         return np.asarray(projector, dtype=np.complex128)
 
+    def _make_cached_projector_term(self, label: str, linear_map_2d: np.ndarray, projector) -> SimpleNamespace:
+        projector = self._normalize_projector_matrix(projector)
+        if scipy.sparse.issparse(projector):
+            projector_h = projector.conj().T.tocsr()
+        else:
+            projector_h = np.asarray(projector, dtype=np.complex128).conj().T
+        return SimpleNamespace(
+            label=label,
+            linear_map_2d=np.asarray(linear_map_2d, dtype=float),
+            projector=projector,
+            projector_h=projector_h,
+        )
+
     def _build_m_valley_c3_reference_projectors(self) -> list[SimpleNamespace]:
         reference_params = self._m_valley_parameters[self._m_valley_reference]
         projectors: list[SimpleNamespace] = []
 
         def _append_projector(label: str, linear_map_2d: np.ndarray, projector) -> None:
-            projectors.append(
-                SimpleNamespace(
-                    label=label,
-                    linear_map_2d=np.asarray(linear_map_2d, dtype=float),
-                    projector=self._normalize_projector_matrix(projector),
-                )
-            )
+            projectors.append(self._make_cached_projector_term(label, linear_map_2d, projector))
 
         _append_projector("identity", np.eye(2, dtype=float), reference_params.g_matrix)
 
@@ -2647,13 +2761,7 @@ class BandStructureCalculator:
         projectors: list[SimpleNamespace] = []
 
         def _append_projector(label: str, linear_map_2d: np.ndarray, projector) -> None:
-            projectors.append(
-                SimpleNamespace(
-                    label=label,
-                    linear_map_2d=np.asarray(linear_map_2d, dtype=float),
-                    projector=self._normalize_projector_matrix(projector),
-                )
-            )
+            projectors.append(self._make_cached_projector_term(label, linear_map_2d, projector))
 
         _append_projector("identity", np.eye(2, dtype=float), reference_params.g_matrix)
 
@@ -3055,66 +3163,8 @@ class BandStructureCalculator:
     @timing_decorator_factory(process_id=0)
     def Getk_super_gauge_sparse(self, Hr, k, type = "H"):
         """Get k-space Hamiltonian from real space Hamiltonian"""
-        kvec = self.get_kvec(k)
-        self._ensure_sorted_wann_cache()
-        sorted_wann = self._sorted_wann
-        num_wann = self._num_wann
-        if sorted_wann is None or num_wann is None:
-            raise RuntimeError("sorted_wann cache is not initialized")
-
-        use_fast = bool(getattr(self.config, "fast_getk", True))
-        if use_fast:
-            # Precompute (wann_center · kvec) once per k-point, then reuse via indexing.
-            # This avoids many tiny BLAS GEMV calls (width=3) inside the rvec loop, which can be
-            # surprisingly slow especially under MKL/OpenMP.
-            phase_wann = (
-                sorted_wann[:, 0] * kvec[0]
-                + sorted_wann[:, 1] * kvec[1]
-                + sorted_wann[:, 2] * kvec[2]
-            )
-
-            # Build in one shot (COO->CSR) instead of repeated CSR additions.
-            # This is usually much faster for large Hr/Sr.
-            nnz_total = int(sum(len(v["val"]) for v in Hr.values()))
-            rows = np.empty(nnz_total, dtype=np.int64)
-            cols = np.empty(nnz_total, dtype=np.int64)
-            data = np.empty(nnz_total, dtype=np.complex128)
-
-            off = 0
-            for rvec, values_dic in Hr.items():
-                row_index = np.asarray(values_dic["row"], dtype=np.int64)
-                col_index = np.asarray(values_dic["col"], dtype=np.int64)
-                val_index = np.asarray(values_dic["val"]).astype(np.complex128, copy=False)
-                n = int(val_index.shape[0])
-
-                rows[off : off + n] = row_index
-                cols[off : off + n] = col_index
-
-                Rvec = np.dot(rvec, self.structure.Tmat)
-                exp_kR = np.exp(1j * np.dot(kvec, Rvec))
-                dot_mn = phase_wann[row_index] - phase_wann[col_index]
-                phase_factor = np.exp(-1j * dot_mn) * exp_kR
-                data[off : off + n] = val_index * phase_factor
-                off += n
-
-            mk = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(num_wann, num_wann), dtype=np.complex128).tocsr()
-            mk.sum_duplicates()
-        else:
-            mk = scipy.sparse.csr_matrix((num_wann, num_wann), dtype=np.complex128)
-            for rvec, values_dic in Hr.items():
-                row_index, col_index, val_index = values_dic["row"], values_dic["col"], values_dic["val"]
-                m_coor, n_coor = sorted_wann[row_index], sorted_wann[col_index]
-                Rvec = np.dot(rvec, self.structure.Tmat)
-                phase_factor = np.exp(-1j * np.dot(m_coor - n_coor, kvec)) * np.exp(1j * np.dot(kvec, Rvec))
-                mk += scipy.sparse.csr_matrix(
-                    (np.asarray(val_index).astype(np.complex128, copy=False) * phase_factor, (row_index, col_index)),
-                    shape=(num_wann, num_wann),
-                )
-
-        # --- 电场修正：加到对角元 ---
-        if type == "H" and self._ef_onsite_orb is not None:
-            mk = mk + scipy.sparse.diags(self._ef_onsite_orb, 0, shape=(num_wann, num_wann), dtype=np.float64)
-        return mk
+        phase_ctx = self._build_getk_phase_context(k)
+        return self._assemble_sparse_realspace_matrix(Hr, phase_ctx, type=type)
 
     @timing_decorator_factory(process_id=0)
     def Getk_super_gauge_sparse_symm(self, Hr, k):
@@ -3197,12 +3247,13 @@ class BandStructureCalculator:
     @timing_decorator_factory(process_id=0) 
     def Getk_super_gauge_sparse_final_HS(self, Hr, Sr, k, mpi_index):
         """Get final Hamiltonian for orthogonal or non-orthogonal basis (no symmetry)"""
-        Hk = self.Getk_super_gauge_sparse(Hr, k, type = "H")
+        phase_ctx = self._build_getk_phase_context(k)
+        Hk = self._assemble_sparse_realspace_matrix(Hr, phase_ctx, type="H")
         Hk = self.cal_TAPW_hamiltonian_k(Hk)
         if self.config.orthogonal_basis:
             return Hk, None
         else:
-            Sk = self.Getk_super_gauge_sparse(Sr, k, type = "S")
+            Sk = self._assemble_sparse_realspace_matrix(Sr, phase_ctx, type="S")
             Sk = self.cal_TAPW_hamiltonian_k(Sk)
             if not self.config.ge:
                 Hk = self.gen_H_new(Hk, Sk, mpi_index)
@@ -3328,21 +3379,22 @@ class BandStructureCalculator:
         return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
 
     def _get_raw_tapw_projected_hs_for_parameters(self, Hr, Sr, k, mpi_index, tapw_parameters):
-        h_full = self.Getk_super_gauge_sparse(Hr, k, type="H")
+        phase_ctx = self._build_getk_phase_context(k)
+        h_full = self._assemble_sparse_realspace_matrix(Hr, phase_ctx, type="H")
         hamk = self.cal_TAPW_hamiltonian_k_cpu(h_full, tapw_parameters=tapw_parameters)
 
         orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
         if orthogonal_basis:
             return hamk, None
 
-        s_full = self.Getk_super_gauge_sparse(Sr, k, type="S")
+        s_full = self._assemble_sparse_realspace_matrix(Sr, phase_ctx, type="S")
         samk = self.cal_TAPW_hamiltonian_k_cpu(s_full, tapw_parameters=tapw_parameters)
         return hamk, samk
 
-    def _project_full_space_matrix_with_projector(self, full_matrix, projector, force_sparse_dot: bool = False):
+    def _project_full_space_matrix_with_projector(self, full_matrix, projector, projector_h=None, force_sparse_dot: bool = False):
         if scipy.sparse.issparse(projector):
             projector = projector.tocsr()
-            projector_h = projector.conj().T.tocsr()
+            projector_h = projector.conj().T.tocsr() if projector_h is None else projector_h.tocsr()
             use_sparse_dot = bool(force_sparse_dot or getattr(self.config, "use_sparse_dot_mkl", False))
             if (
                 use_sparse_dot
@@ -3356,19 +3408,31 @@ class BandStructureCalculator:
             return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
 
         projector = np.asarray(projector, dtype=np.complex128)
+        projector_h = projector.conj().T if projector_h is None else np.asarray(projector_h, dtype=np.complex128)
         full_matrix = full_matrix.toarray() if scipy.sparse.issparse(full_matrix) else np.asarray(full_matrix)
-        return np.asarray(projector @ full_matrix @ projector.conj().T)
+        return np.asarray(projector @ full_matrix @ projector_h)
 
-    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector, force_sparse_dot: bool = False):
-        h_full = self.Getk_super_gauge_sparse(Hr, k, type="H")
-        hamk = self._project_full_space_matrix_with_projector(h_full, projector, force_sparse_dot=force_sparse_dot)
+    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector, projector_h=None, force_sparse_dot: bool = False):
+        phase_ctx = self._build_getk_phase_context(k)
+        h_full = self._assemble_sparse_realspace_matrix(Hr, phase_ctx, type="H")
+        hamk = self._project_full_space_matrix_with_projector(
+            h_full,
+            projector,
+            projector_h=projector_h,
+            force_sparse_dot=force_sparse_dot,
+        )
 
         orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
         if orthogonal_basis:
             return hamk, None
 
-        s_full = self.Getk_super_gauge_sparse(Sr, k, type="S")
-        samk = self._project_full_space_matrix_with_projector(s_full, projector, force_sparse_dot=force_sparse_dot)
+        s_full = self._assemble_sparse_realspace_matrix(Sr, phase_ctx, type="S")
+        samk = self._project_full_space_matrix_with_projector(
+            s_full,
+            projector,
+            projector_h=projector_h,
+            force_sparse_dot=force_sparse_dot,
+        )
         return hamk, samk
 
     def _finalize_tapw_projected_hs(self, hamk, samk, mpi_index):
@@ -3402,13 +3466,17 @@ class BandStructureCalculator:
                 self.structure.reciprocal_Tmat,
                 projector_term.linear_map_2d,
             )
+            projector_kwargs = {"force_sparse_dot": True}
+            projector_h = getattr(projector_term, "projector_h", None)
+            if projector_h is not None:
+                projector_kwargs["projector_h"] = projector_h
             hamk, samk = self._get_raw_projected_hs_with_projector(
                 self.hr_supercell,
                 self.sr_supercell,
                 k_transformed,
                 mpi_index,
                 projector_term.projector,
-                force_sparse_dot=True,
+                **projector_kwargs,
             )
             h_sum = np.array(hamk, copy=True) if h_sum is None else (h_sum + hamk)
             if orthogonal_basis:
@@ -3439,12 +3507,17 @@ class BandStructureCalculator:
                 self.structure.reciprocal_Tmat,
                 projector_term.linear_map_2d,
             )
+            projector_kwargs = {}
+            projector_h = getattr(projector_term, "projector_h", None)
+            if projector_h is not None:
+                projector_kwargs["projector_h"] = projector_h
             hamk, samk = self._get_raw_projected_hs_with_projector(
                 self.hr_supercell,
                 self.sr_supercell,
                 k_transformed,
                 mpi_index,
                 projector_term.projector,
+                **projector_kwargs,
             )
             h_sum = np.array(hamk, copy=True) if h_sum is None else (h_sum + hamk)
             if orthogonal_basis:
