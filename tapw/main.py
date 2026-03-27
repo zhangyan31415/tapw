@@ -5,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 import os
+import shutil
 from typing import Tuple
 
 from .config import Config
@@ -77,6 +78,37 @@ def parse_args():
     parser.add_argument('--kpoint_chunk_count', type=int,
                        help='Total chunk count for job-array sharding (overrides config file)')
     return parser.parse_args()
+
+
+def can_reuse_m_valley_c3_band_outputs(compute_cfg) -> bool:
+    valleys = list(getattr(compute_cfg, "valleys", []) or [])
+    return bool(
+        getattr(compute_cfg, "mode", None) == "band"
+        and getattr(compute_cfg, "TAPW", False)
+        and getattr(compute_cfg, "C3_H", False)
+        and not getattr(compute_cfg, "M_valley_D3_H", False)
+        and not getattr(compute_cfg, "eig_vec_cal", False)
+        and not getattr(compute_cfg, "hamk_save", False)
+        and len(valleys) > 1
+        and all(valley in (31, 32, 33) for valley in valleys)
+        and str(getattr(compute_cfg, "bravais", "hex")).lower() == "hex"
+    )
+
+
+def copy_reused_m_valley_band_outputs(qshell_path: Path, source_valley_flag: str, target_valley_flag: str) -> None:
+    band_dir = Path(qshell_path) / "band"
+    band_dir.mkdir(exist_ok=True)
+    source_files = sorted(band_dir.glob(f"*_{source_valley_flag}_valley*.txt"))
+    if not source_files:
+        raise FileNotFoundError(
+            f"No reusable band files found in {band_dir} for source valley flag {source_valley_flag}"
+        )
+    for source in source_files:
+        target_name = source.name.replace(
+            f"_{source_valley_flag}_valley",
+            f"_{target_valley_flag}_valley",
+        )
+        shutil.copy2(source, band_dir / target_name)
 
 def main():
     """Main program"""
@@ -251,6 +283,9 @@ def main():
             # For slab mode, k-path is handled internally by TAPWSlab
             pass
 
+        reuse_m_valley_band_outputs = can_reuse_m_valley_c3_band_outputs(config.compute)
+        reused_reference_valley_flag = None
+
         # Calculate for each valley
         for valley in config.compute.valleys:
             logger.info(f"Starting calculation for valley {valley}")
@@ -282,8 +317,23 @@ def main():
                 calculator.calculate_ribbon_bands(str(out_path))
                 logger.info(f"Completed slab calculation for valley {valley}")
             else:
-                calculator.run_calculation(str(out_path))
-                logger.info(f"Completed calculation for valley {valley}")
+                if reuse_m_valley_band_outputs and reused_reference_valley_flag is not None:
+                    calculator.save_band_static_metadata(str(out_path))
+                    copy_reused_m_valley_band_outputs(
+                        out_path,
+                        source_valley_flag=reused_reference_valley_flag,
+                        target_valley_flag=calculator.valley_flag,
+                    )
+                    logger.info(
+                        "Reused M-valley C3-only band outputs for valley %s from reference valley flag %s",
+                        valley,
+                        reused_reference_valley_flag,
+                    )
+                else:
+                    calculator.run_calculation(str(out_path))
+                    logger.info(f"Completed calculation for valley {valley}")
+                    if reuse_m_valley_band_outputs and getattr(calculator, "use_M_valley_threefold_symm", False):
+                        reused_reference_valley_flag = calculator.valley_flag
 
     except Exception as e:
         logger.error(f"Error during calculation: {str(e)}", exc_info=True)

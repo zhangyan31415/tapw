@@ -2916,6 +2916,23 @@ class BandStructureCalculator:
         
         return filtered_energies, vbm_energies, cbm_energies, pivot_col, vbm_vecs, cbm_vecs
 
+    def save_band_static_metadata(self, path):
+        os.makedirs(path, exist_ok=True)
+        if self.config.TAPW:
+            np.save(
+                os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.valley_flag}_1layer"),
+                self.TAPW_parameters.g_vec_list_K1,
+            )
+            np.save(
+                os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.valley_flag}_2layer"),
+                self.TAPW_parameters.g_vec_list_K2,
+            )
+        if self.use_C3_H:
+            np.save(
+                os.path.join(path, f"C3_matrix_{self.valley_flag}"),
+                self.TAPW_parameters.C3_matrix.toarray(),
+            )
+
     def calculate_band_structure(self, path, kpoints=None):
         """Calculate band structure
         
@@ -2962,15 +2979,7 @@ class BandStructureCalculator:
         else:
             kpoint_indices = list(range(nk_total))
         
-        # Save g-vectors if using TAPW
-        if self.config.TAPW:
-            np.save(os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.valley_flag}_1layer"),
-                   self.TAPW_parameters.g_vec_list_K1)
-            np.save(os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.valley_flag}_2layer"),
-                   self.TAPW_parameters.g_vec_list_K2)
-        if self.use_C3_H:
-            np.save(os.path.join(path, f"C3_matrix_{self.valley_flag}"),
-                   self.TAPW_parameters.C3_matrix.toarray())
+        self.save_band_static_metadata(path)
         # Calculate bands
         self.parallel_calculate_band_01(
             kpoints,
