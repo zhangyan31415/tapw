@@ -276,6 +276,7 @@ def main():
 
         reuse_m_valley_band_outputs = can_reuse_m_valley_c3_band_outputs(config.compute)
         reused_reference_valley_flag = None
+        reusable_m_valley_calculator = None
 
         # Calculate for each valley
         for valley in config.compute.valleys:
@@ -293,13 +294,23 @@ def main():
                     kpath_config=kpath_config
                 )
             else:
-                calculator = BandStructureCalculator(
-                    hr_supercell=hr,
-                    sr_supercell=sr,
-                    structure=processor,
-                    config=config.compute,
-                    kpath_config=kpath_config
-                )
+                if reusable_m_valley_calculator is not None:
+                    reusable_m_valley_calculator.switch_m_valley(valley)
+                    calculator = reusable_m_valley_calculator
+                    logger.info(
+                        "Reusing initialized M-valley symmetry state for valley %s",
+                        valley,
+                    )
+                else:
+                    calculator = BandStructureCalculator(
+                        hr_supercell=hr,
+                        sr_supercell=sr,
+                        structure=processor,
+                        config=config.compute,
+                        kpath_config=kpath_config
+                    )
+                    if getattr(calculator, "use_M_valley_threefold_symm", False):
+                        reusable_m_valley_calculator = calculator
             
             out_path = Path(config.paths.output_dir) / f"Q_shell_{config.compute.n_g}"
             out_path.mkdir(exist_ok=True)

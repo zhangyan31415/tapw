@@ -2532,6 +2532,21 @@ class BandStructureCalculator:
     def _set_progress_stage(self, index: int, stage: str) -> None:
         _write_progress_state(self._progress_dir, index, stage)
 
+    def _refresh_ef_onsite_orb_cache(self) -> None:
+        if self._sorted_wann is None or self._num_wann is None:
+            return
+
+        ef = getattr(getattr(self, "TAPW_parameters", None), "electric_field_onsite", None)
+        if ef is None:
+            self._ef_onsite_orb = None
+            return
+
+        orb_num = self.structure.df['orb_num'].to_numpy(dtype=int, copy=False)
+        ef_orb = np.repeat(np.asarray(ef, dtype=np.float64), orb_num)
+        if self.structure.spin:
+            ef_orb = np.tile(ef_orb, 2)
+        self._ef_onsite_orb = ef_orb
+
     def _ensure_sorted_wann_cache(self) -> None:
         if self._sorted_wann is not None and self._num_wann is not None:
             return
@@ -2544,18 +2559,7 @@ class BandStructureCalculator:
 
         self._sorted_wann = sorted_wann
         self._num_wann = int(sorted_wann.shape[0])
-
-        # Precompute electric-field onsite term expanded to orbitals (if used).
-        ef = None
-        if hasattr(self, 'TAPW_parameters'):
-            ef = getattr(self.TAPW_parameters, 'electric_field_onsite', None)
-        if ef is not None:
-            ef_orb = np.repeat(np.asarray(ef, dtype=np.float64), orb_num)
-            if self.structure.spin:
-                ef_orb = np.tile(ef_orb, 2)
-            self._ef_onsite_orb = ef_orb
-        else:
-            self._ef_onsite_orb = None
+        self._refresh_ef_onsite_orb_cache()
 
     def _get_or_build_realspace_block_cache(self, hr_blocks) -> SimpleNamespace:
         cache_key = id(hr_blocks)
@@ -2714,6 +2718,19 @@ class BandStructureCalculator:
             self._m_valley_c2_reference_linear_map = None
             self._m_valley_c2_reference_transport = None
             self._m_valley_d3_reference_projectors = self._build_m_valley_d3_reference_projectors()
+
+    def switch_m_valley(self, valley: int) -> None:
+        if not getattr(self, "use_M_valley_threefold_symm", False):
+            raise ValueError("switch_m_valley is only valid for M-valley threefold-symmetrized calculators.")
+        if valley not in self._m_valley_parameters:
+            raise ValueError(f"M-valley {valley} is not initialized in this calculator.")
+
+        self.config.valley = valley
+        self.valley_flag = self.VALLEY_MAP[valley]
+        self.TAPW_parameters = self._m_valley_parameters[valley]
+        self.result = {}
+        self._progress_dir = None
+        self._refresh_ef_onsite_orb_cache()
 
     def _normalize_projector_matrix(self, projector):
         if scipy.sparse.issparse(projector):
