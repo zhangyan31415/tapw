@@ -639,6 +639,133 @@ def test_calculate_reference_m_valley_c3_hs_averages_cached_projector_terms():
     assert all(term[2] is True for term in seen_terms)
 
 
+def test_calculate_reference_m_valley_c3_hs_prefers_valley_projection_then_transport_when_metadata_is_available():
+    calculator_cls = getattr(cal_ham_01, "BandStructureCalculator", None)
+    assert calculator_cls is not None
+
+    h_ref = np.array([[1.0, 0.2], [0.2, 3.0]], dtype=np.complex128)
+    s_ref = np.array([[2.0, 0.1], [0.1, 4.0]], dtype=np.complex128)
+    h_m2 = np.array([[5.0, -0.4j], [0.4j, 7.0]], dtype=np.complex128)
+    s_m2 = np.array([[6.0, -0.3], [-0.3, 8.0]], dtype=np.complex128)
+    h_m3 = np.array([[9.0, 0.6j], [-0.6j, 11.0]], dtype=np.complex128)
+    s_m3 = np.array([[10.0, 0.2], [0.2, 12.0]], dtype=np.complex128)
+
+    u_m2_to_ref = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    u_m3_to_ref = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
+
+    fake = SimpleNamespace()
+    fake.hr_supercell = object()
+    fake.sr_supercell = object()
+    fake.structure = SimpleNamespace(reciprocal_Tmat=np.eye(3))
+    fake.config = SimpleNamespace(orthogonal_basis=False)
+    fake._m_valley_reference = 31
+    fake._m_valley_c3_reference_projectors = [
+        SimpleNamespace(
+            label="identity",
+            valley=31,
+            linear_map_2d=np.eye(2, dtype=float),
+            tapw_parameters="ref_params",
+            transport_to_ref=np.eye(2, dtype=np.complex128),
+        ),
+        SimpleNamespace(
+            label="c3_valley_32",
+            valley=32,
+            linear_map_2d=np.array(
+                [
+                    [-0.5, -np.sqrt(3.0) / 2.0],
+                    [np.sqrt(3.0) / 2.0, -0.5],
+                ],
+                dtype=float,
+            ),
+            tapw_parameters="m2_params",
+            transport_to_ref=u_m2_to_ref,
+        ),
+        SimpleNamespace(
+            label="c3_valley_33",
+            valley=33,
+            linear_map_2d=np.array(
+                [
+                    [-0.5, np.sqrt(3.0) / 2.0],
+                    [-np.sqrt(3.0) / 2.0, -0.5],
+                ],
+                dtype=float,
+            ),
+            tapw_parameters="m3_params",
+            transport_to_ref=u_m3_to_ref,
+        ),
+    ]
+
+    seen_terms = []
+
+    def _get_raw_tapw_projected_hs_for_parameters(
+        self,
+        Hr,
+        Sr,
+        k,
+        mpi_index,
+        tapw_parameters,
+        force_sparse_dot=False,
+    ):
+        seen_terms.append((tapw_parameters, np.asarray(k, dtype=float), bool(force_sparse_dot)))
+        if tapw_parameters == "ref_params":
+            return h_ref, s_ref
+        if tapw_parameters == "m2_params":
+            return h_m2, s_m2
+        if tapw_parameters == "m3_params":
+            return h_m3, s_m3
+        raise AssertionError(f"unexpected tapw_parameters {tapw_parameters!r}")
+
+    def _get_raw_projected_hs_with_projector(self, *args, **kwargs):
+        raise AssertionError(
+            "projector path should not run when per-valley TAPW metadata is available"
+        )
+
+    fake._get_raw_tapw_projected_hs_for_parameters = MethodType(
+        _get_raw_tapw_projected_hs_for_parameters,
+        fake,
+    )
+    fake._get_raw_projected_hs_with_projector = MethodType(
+        _get_raw_projected_hs_with_projector,
+        fake,
+    )
+
+    k_input = np.array([0.2, 0.1, 0.0], dtype=float)
+    hamk, samk = calculator_cls._calculate_reference_m_valley_c3_hs(fake, k_input, mpi_index=0)
+
+    expected_h, expected_s = cal_ham_01.threefold_reference_hs_average(
+        h_ref,
+        s_ref,
+        h_m2,
+        s_m2,
+        h_m3,
+        s_m3,
+        u_m2_to_ref,
+        u_m3_to_ref,
+    )
+    rot120 = np.array(
+        [
+            [-0.5, -np.sqrt(3.0) / 2.0],
+            [np.sqrt(3.0) / 2.0, -0.5],
+        ],
+        dtype=float,
+    )
+    rot240 = np.array(
+        [
+            [-0.5, np.sqrt(3.0) / 2.0],
+            [-np.sqrt(3.0) / 2.0, -0.5],
+        ],
+        dtype=float,
+    )
+
+    assert np.allclose(hamk, expected_h)
+    assert np.allclose(samk, expected_s)
+    assert len(seen_terms) == 3
+    assert np.allclose(seen_terms[0][1], k_input)
+    assert np.allclose(seen_terms[1][1], np.array([*(rot120 @ k_input[:2]), 0.0], dtype=float))
+    assert np.allclose(seen_terms[2][1], np.array([*(rot240 @ k_input[:2]), 0.0], dtype=float))
+    assert all(term[2] is True for term in seen_terms)
+
+
 def test_calculate_reference_m_valley_d3_hs_averages_cached_projector_terms():
     calculator_cls = getattr(cal_ham_01, "BandStructureCalculator", None)
     assert calculator_cls is not None

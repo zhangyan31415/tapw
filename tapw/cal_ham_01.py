@@ -2722,7 +2722,15 @@ class BandStructureCalculator:
             return projector
         return np.asarray(projector, dtype=np.complex128)
 
-    def _make_cached_projector_term(self, label: str, linear_map_2d: np.ndarray, projector) -> SimpleNamespace:
+    def _make_cached_projector_term(
+        self,
+        label: str,
+        linear_map_2d: np.ndarray,
+        projector,
+        valley: int | None = None,
+        tapw_parameters=None,
+        transport_to_ref=None,
+    ) -> SimpleNamespace:
         projector = self._normalize_projector_matrix(projector)
         if scipy.sparse.issparse(projector):
             projector_h = projector.conj().T.tocsr()
@@ -2733,22 +2741,55 @@ class BandStructureCalculator:
             linear_map_2d=np.asarray(linear_map_2d, dtype=float),
             projector=projector,
             projector_h=projector_h,
+            valley=valley,
+            tapw_parameters=tapw_parameters,
+            transport_to_ref=transport_to_ref,
         )
 
     def _build_m_valley_c3_reference_projectors(self) -> list[SimpleNamespace]:
         reference_params = self._m_valley_parameters[self._m_valley_reference]
         projectors: list[SimpleNamespace] = []
 
-        def _append_projector(label: str, linear_map_2d: np.ndarray, projector) -> None:
-            projectors.append(self._make_cached_projector_term(label, linear_map_2d, projector))
+        def _append_projector(
+            label: str,
+            linear_map_2d: np.ndarray,
+            projector,
+            valley: int,
+            tapw_parameters,
+            transport_to_ref,
+        ) -> None:
+            projectors.append(
+                self._make_cached_projector_term(
+                    label,
+                    linear_map_2d,
+                    projector,
+                    valley=valley,
+                    tapw_parameters=tapw_parameters,
+                    transport_to_ref=transport_to_ref,
+                )
+            )
 
-        _append_projector("identity", np.eye(2, dtype=float), reference_params.g_matrix)
+        _append_projector(
+            "identity",
+            np.eye(2, dtype=float),
+            reference_params.g_matrix,
+            valley=self._m_valley_reference,
+            tapw_parameters=reference_params,
+            transport_to_ref=self._m_valley_transport_valley_to_ref[self._m_valley_reference],
+        )
 
         for valley in (32, 33):
             angle_deg = _m_valley_rotation_delta(self._m_valley_reference, valley)
             rotation = np.asarray(rot_matrix(angle_deg), dtype=float)
             projector = self._m_valley_transport_valley_to_ref[valley] @ self._m_valley_parameters[valley].g_matrix
-            _append_projector(f"c3_valley_{valley}", rotation[:2, :2], projector)
+            _append_projector(
+                f"c3_valley_{valley}",
+                rotation[:2, :2],
+                projector,
+                valley=valley,
+                tapw_parameters=self._m_valley_parameters[valley],
+                transport_to_ref=self._m_valley_transport_valley_to_ref[valley],
+            )
 
         return projectors
 
@@ -3371,13 +3412,13 @@ class BandStructureCalculator:
         #     return self.cal_TAPW_hamiltonian_k_gpu(hamk)
         return self.cal_TAPW_hamiltonian_k_cpu(hamk)
 
-    def cal_TAPW_hamiltonian_k_cpu(self, hamk, tapw_parameters=None):
+    def cal_TAPW_hamiltonian_k_cpu(self, hamk, tapw_parameters=None, force_sparse_dot: bool = False):
         """CPU version of TAPW Hamiltonian calculation"""
         tapw_parameters = self.TAPW_parameters if tapw_parameters is None else tapw_parameters
         g = tapw_parameters.g_matrix
         gH = tapw_parameters.g_matrix_conj
 
-        use_sparse_dot = bool(getattr(self.config, "use_sparse_dot_mkl", False))
+        use_sparse_dot = bool(force_sparse_dot or getattr(self.config, "use_sparse_dot_mkl", False))
         if use_sparse_dot and _HAS_SPARSE_DOT_MKL and scipy.sparse.issparse(g) and scipy.sparse.issparse(hamk) and scipy.sparse.issparse(gH):
             # MKL sparse GEMM is multi-threaded and usually much faster than SciPy's sparse matmul.
             tmp = dot_product_mkl(g, hamk, dense=False)
@@ -3387,17 +3428,33 @@ class BandStructureCalculator:
         result = g @ hamk @ gH
         return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
 
-    def _get_raw_tapw_projected_hs_for_parameters(self, Hr, Sr, k, mpi_index, tapw_parameters):
+    def _get_raw_tapw_projected_hs_for_parameters(
+        self,
+        Hr,
+        Sr,
+        k,
+        mpi_index,
+        tapw_parameters,
+        force_sparse_dot: bool = False,
+    ):
         phase_ctx = self._build_getk_phase_context(k)
         h_full = self._assemble_sparse_realspace_matrix(Hr, phase_ctx, type="H")
-        hamk = self.cal_TAPW_hamiltonian_k_cpu(h_full, tapw_parameters=tapw_parameters)
+        hamk = self.cal_TAPW_hamiltonian_k_cpu(
+            h_full,
+            tapw_parameters=tapw_parameters,
+            force_sparse_dot=force_sparse_dot,
+        )
 
         orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
         if orthogonal_basis:
             return hamk, None
 
         s_full = self._assemble_sparse_realspace_matrix(Sr, phase_ctx, type="S")
-        samk = self.cal_TAPW_hamiltonian_k_cpu(s_full, tapw_parameters=tapw_parameters)
+        samk = self.cal_TAPW_hamiltonian_k_cpu(
+            s_full,
+            tapw_parameters=tapw_parameters,
+            force_sparse_dot=force_sparse_dot,
+        )
         return hamk, samk
 
     def _project_full_space_matrix_with_projector(self, full_matrix, projector, projector_h=None, force_sparse_dot: bool = False):
@@ -3475,18 +3532,35 @@ class BandStructureCalculator:
                 self.structure.reciprocal_Tmat,
                 projector_term.linear_map_2d,
             )
-            projector_kwargs = {"force_sparse_dot": True}
-            projector_h = getattr(projector_term, "projector_h", None)
-            if projector_h is not None:
-                projector_kwargs["projector_h"] = projector_h
-            hamk, samk = self._get_raw_projected_hs_with_projector(
-                self.hr_supercell,
-                self.sr_supercell,
-                k_transformed,
-                mpi_index,
-                projector_term.projector,
-                **projector_kwargs,
-            )
+            tapw_parameters = getattr(projector_term, "tapw_parameters", None)
+            transport_to_ref = getattr(projector_term, "transport_to_ref", None)
+            projector_valley = getattr(projector_term, "valley", None)
+            if tapw_parameters is not None and transport_to_ref is not None:
+                hamk, samk = self._get_raw_tapw_projected_hs_for_parameters(
+                    self.hr_supercell,
+                    self.sr_supercell,
+                    k_transformed,
+                    mpi_index,
+                    tapw_parameters,
+                    force_sparse_dot=True,
+                )
+                if projector_valley != self._m_valley_reference:
+                    hamk = transport_matrix_between_m_valleys(hamk, transport_to_ref)
+                    if samk is not None:
+                        samk = transport_matrix_between_m_valleys(samk, transport_to_ref)
+            else:
+                projector_kwargs = {"force_sparse_dot": True}
+                projector_h = getattr(projector_term, "projector_h", None)
+                if projector_h is not None:
+                    projector_kwargs["projector_h"] = projector_h
+                hamk, samk = self._get_raw_projected_hs_with_projector(
+                    self.hr_supercell,
+                    self.sr_supercell,
+                    k_transformed,
+                    mpi_index,
+                    projector_term.projector,
+                    **projector_kwargs,
+                )
             h_sum = np.array(hamk, copy=True) if h_sum is None else (h_sum + hamk)
             if orthogonal_basis:
                 continue
