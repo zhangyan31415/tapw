@@ -158,15 +158,15 @@ def test_m_valley_threefold_hs_ge_false_standardizes_only_after_raw_average():
     assert calculator_cls is not None
 
     raw_hs = {
-        31: (
+        "identity": (
             np.array([[2.0, 0.0], [0.0, 8.0]], dtype=np.complex128),
             np.array([[1.0, 0.0], [0.0, 4.0]], dtype=np.complex128),
         ),
-        32: (
+        "c1": (
             np.array([[18.0, 0.0], [0.0, 32.0]], dtype=np.complex128),
             np.array([[9.0, 0.0], [0.0, 16.0]], dtype=np.complex128),
         ),
-        33: (
+        "c2": (
             np.array([[50.0, 0.0], [0.0, 72.0]], dtype=np.complex128),
             np.array([[25.0, 0.0], [0.0, 36.0]], dtype=np.complex128),
         ),
@@ -176,12 +176,11 @@ def test_m_valley_threefold_hs_ge_false_standardizes_only_after_raw_average():
     fake.config = SimpleNamespace(valley=31, orthogonal_basis=False, ge=False)
     fake.structure = SimpleNamespace(reciprocal_Tmat=np.eye(3))
     fake._m_valley_reference = 31
-    fake._m_valley_parameters = {31: object(), 32: object(), 33: object()}
-    fake._m_valley_transport_valley_to_ref = {
-        31: np.eye(2, dtype=np.complex128),
-        32: np.eye(2, dtype=np.complex128),
-        33: np.eye(2, dtype=np.complex128),
-    }
+    fake._m_valley_c3_reference_projectors = [
+        SimpleNamespace(label="identity", linear_map_2d=np.eye(2, dtype=float), projector="identity"),
+        SimpleNamespace(label="c3_valley_32", linear_map_2d=np.array([[-0.5, -np.sqrt(3.0) / 2.0], [np.sqrt(3.0) / 2.0, -0.5]], dtype=float), projector="c1"),
+        SimpleNamespace(label="c3_valley_33", linear_map_2d=np.array([[-0.5, np.sqrt(3.0) / 2.0], [-np.sqrt(3.0) / 2.0, -0.5]], dtype=float), projector="c2"),
+    ]
     fake._m_valley_transport_ref_to_valley = {
         31: np.eye(2, dtype=np.complex128),
         32: np.eye(2, dtype=np.complex128),
@@ -190,15 +189,14 @@ def test_m_valley_threefold_hs_ge_false_standardizes_only_after_raw_average():
     fake.hr_supercell = object()
     fake.sr_supercell = object()
 
-    def _get_raw_tapw_projected_hs_for_parameters(self, Hr, Sr, k, mpi_index, tapw_parameters):
-        valley = {id(v): key for key, v in self._m_valley_parameters.items()}[id(tapw_parameters)]
-        return raw_hs[valley]
+    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector, force_sparse_dot=False):
+        return raw_hs[projector]
 
     def _finalize_tapw_projected_hs(self, hamk, samk, mpi_index):
         return hamk + 10.0 * samk, None
 
-    fake._get_raw_tapw_projected_hs_for_parameters = MethodType(
-        _get_raw_tapw_projected_hs_for_parameters,
+    fake._get_raw_projected_hs_with_projector = MethodType(
+        _get_raw_projected_hs_with_projector,
         fake,
     )
     fake._finalize_tapw_projected_hs = MethodType(_finalize_tapw_projected_hs, fake)
@@ -209,8 +207,8 @@ def test_m_valley_threefold_hs_ge_false_standardizes_only_after_raw_average():
 
     hamk, samk = calculator_cls._calculate_m_valley_threefold_hs(fake, np.zeros(3), mpi_index=0)
 
-    h_avg = (raw_hs[31][0] + raw_hs[32][0] + raw_hs[33][0]) / 3.0
-    s_avg = (raw_hs[31][1] + raw_hs[32][1] + raw_hs[33][1]) / 3.0
+    h_avg = (raw_hs["identity"][0] + raw_hs["c1"][0] + raw_hs["c2"][0]) / 3.0
+    s_avg = (raw_hs["identity"][1] + raw_hs["c1"][1] + raw_hs["c2"][1]) / 3.0
     expected = h_avg + 10.0 * s_avg
 
     assert np.allclose(hamk, expected)
@@ -540,6 +538,105 @@ def test_m_valley_d3_hs_uses_cached_reference_projector_average_then_derives_tar
     assert np.allclose(samk, expected_s)
     assert len(seen_k) == 1
     assert np.allclose(seen_k[0], expected_k_reference)
+
+
+def test_m_valley_c3_hs_skips_target_transport_for_eigenvalue_only_runs():
+    calculator_cls = getattr(cal_ham_01, "BandStructureCalculator", None)
+    assert calculator_cls is not None
+
+    h_ref = np.array([[1.0, 2.0 + 1.0j], [2.0 - 1.0j, 5.0]], dtype=np.complex128)
+    s_ref = np.array([[3.0, 0.4], [0.4, 7.0]], dtype=np.complex128)
+    u_ref_to_m2 = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+
+    fake = SimpleNamespace()
+    fake.config = SimpleNamespace(
+        valley=32,
+        orthogonal_basis=False,
+        ge=False,
+        eig_vec_cal=False,
+        hamk_save=False,
+    )
+    fake.structure = SimpleNamespace(reciprocal_Tmat=np.eye(3))
+    fake._m_valley_reference = 31
+    fake.use_M_valley_d3_symm = False
+    fake._m_valley_transport_ref_to_valley = {32: u_ref_to_m2}
+
+    def _finalize_tapw_projected_hs(self, hamk, samk, mpi_index):
+        return hamk + 10.0 * samk, None
+
+    fake._finalize_tapw_projected_hs = MethodType(_finalize_tapw_projected_hs, fake)
+    seen_k = []
+
+    def _calculate_reference_m_valley_c3_hs(self, k_reference, mpi_index):
+        seen_k.append(np.asarray(k_reference, dtype=float))
+        return h_ref, s_ref
+
+    fake._calculate_reference_m_valley_c3_hs = MethodType(_calculate_reference_m_valley_c3_hs, fake)
+
+    k_input = np.array([0.2, 0.1, 0.0], dtype=float)
+    hamk, samk = calculator_cls._calculate_m_valley_threefold_hs(fake, k_input, mpi_index=0)
+
+    expected_k_reference = cal_ham_01.rotate_local_k_between_m_valleys(
+        k_input,
+        fake.structure.reciprocal_Tmat,
+        source_valley=32,
+        target_valley=31,
+    )
+
+    assert np.allclose(hamk, h_ref + 10.0 * s_ref)
+    assert samk is None
+    assert len(seen_k) == 1
+    assert np.allclose(seen_k[0], expected_k_reference)
+
+
+def test_calculate_reference_m_valley_c3_hs_averages_cached_projector_terms():
+    calculator_cls = getattr(cal_ham_01, "BandStructureCalculator", None)
+    assert calculator_cls is not None
+
+    h_ref = np.array([[1.0, 0.2], [0.2, 3.0]], dtype=np.complex128)
+    s_ref = np.array([[2.0, 0.1], [0.1, 4.0]], dtype=np.complex128)
+    h_c1 = np.array([[5.0, -0.4j], [0.4j, 7.0]], dtype=np.complex128)
+    s_c1 = np.array([[6.0, -0.3], [-0.3, 8.0]], dtype=np.complex128)
+    h_c2 = np.array([[9.0, 0.6j], [-0.6j, 11.0]], dtype=np.complex128)
+    s_c2 = np.array([[10.0, 0.2], [0.2, 12.0]], dtype=np.complex128)
+
+    fake = SimpleNamespace()
+    fake.hr_supercell = object()
+    fake.sr_supercell = object()
+    fake.structure = SimpleNamespace(reciprocal_Tmat=np.eye(3))
+    fake._m_valley_c3_reference_projectors = [
+        SimpleNamespace(label="identity", linear_map_2d=np.eye(2, dtype=float), projector="identity"),
+        SimpleNamespace(label="c3_valley_32", linear_map_2d=np.array([[-0.5, -np.sqrt(3.0) / 2.0], [np.sqrt(3.0) / 2.0, -0.5]], dtype=float), projector="c1"),
+        SimpleNamespace(label="c3_valley_33", linear_map_2d=np.array([[-0.5, np.sqrt(3.0) / 2.0], [-np.sqrt(3.0) / 2.0, -0.5]], dtype=float), projector="c2"),
+    ]
+
+    seen_terms = []
+
+    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector, force_sparse_dot=False):
+        seen_terms.append((projector, np.asarray(k, dtype=float), bool(force_sparse_dot)))
+        if projector == "identity":
+            return h_ref, s_ref
+        if projector == "c1":
+            return h_c1, s_c1
+        if projector == "c2":
+            return h_c2, s_c2
+        raise AssertionError(f"unexpected projector {projector!r}")
+
+    fake._get_raw_projected_hs_with_projector = MethodType(_get_raw_projected_hs_with_projector, fake)
+
+    k_input = np.array([0.2, 0.1, 0.0], dtype=float)
+    hamk, samk = calculator_cls._calculate_reference_m_valley_c3_hs(fake, k_input, mpi_index=0)
+
+    rot120 = np.array([[-0.5, -np.sqrt(3.0) / 2.0], [np.sqrt(3.0) / 2.0, -0.5]], dtype=float)
+    rot240 = np.array([[-0.5, np.sqrt(3.0) / 2.0], [-np.sqrt(3.0) / 2.0, -0.5]], dtype=float)
+
+    assert np.allclose(hamk, (h_ref + h_c1 + h_c2) / 3.0)
+    assert np.allclose(samk, (s_ref + s_c1 + s_c2) / 3.0)
+    assert len(seen_terms) == 3
+    assert np.allclose(seen_terms[0][1], k_input)
+    assert np.allclose(seen_terms[1][1], np.array([*(rot120 @ k_input[:2]), 0.0], dtype=float))
+    assert np.allclose(seen_terms[2][1], np.array([*(rot240 @ k_input[:2]), 0.0], dtype=float))
+    assert all(term[2] is True for term in seen_terms)
 
 
 def test_calculate_reference_m_valley_d3_hs_averages_cached_projector_terms():

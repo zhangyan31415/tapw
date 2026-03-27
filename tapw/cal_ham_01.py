@@ -2492,6 +2492,7 @@ class BandStructureCalculator:
         self._m_valley_parameters: dict[int, TAPW_parameters] = {}
         self._m_valley_transport_ref_to_valley: dict[int, scipy.sparse.csr_matrix] = {}
         self._m_valley_transport_valley_to_ref: dict[int, scipy.sparse.csr_matrix] = {}
+        self._m_valley_c3_reference_projectors: list[SimpleNamespace] = []
         self._m_valley_d3_reference_projectors: list[SimpleNamespace] = []
         self._m_valley_c2_reference_symmetry: SimpleNamespace | None = None
         self._m_valley_c2_reference_transport: scipy.sparse.csr_matrix | None = None
@@ -2593,6 +2594,8 @@ class BandStructureCalculator:
             self._m_valley_transport_ref_to_valley[valley] = transport
             self._m_valley_transport_valley_to_ref[valley] = transport.conj().T.tocsr()
 
+        self._m_valley_c3_reference_projectors = self._build_m_valley_c3_reference_projectors()
+
         if self.use_M_valley_d3_symm:
             print(
                 f"[M-D3] Enabling additional reference-valley C2 projection on M{self._m_valley_reference - 30}."
@@ -2611,6 +2614,29 @@ class BandStructureCalculator:
             projector.sort_indices()
             return projector
         return np.asarray(projector, dtype=np.complex128)
+
+    def _build_m_valley_c3_reference_projectors(self) -> list[SimpleNamespace]:
+        reference_params = self._m_valley_parameters[self._m_valley_reference]
+        projectors: list[SimpleNamespace] = []
+
+        def _append_projector(label: str, linear_map_2d: np.ndarray, projector) -> None:
+            projectors.append(
+                SimpleNamespace(
+                    label=label,
+                    linear_map_2d=np.asarray(linear_map_2d, dtype=float),
+                    projector=self._normalize_projector_matrix(projector),
+                )
+            )
+
+        _append_projector("identity", np.eye(2, dtype=float), reference_params.g_matrix)
+
+        for valley in (32, 33):
+            angle_deg = _m_valley_rotation_delta(self._m_valley_reference, valley)
+            rotation = np.asarray(rot_matrix(angle_deg), dtype=float)
+            projector = self._m_valley_transport_valley_to_ref[valley] @ self._m_valley_parameters[valley].g_matrix
+            _append_projector(f"c3_valley_{valley}", rotation[:2, :2], projector)
+
+        return projectors
 
     def _build_m_valley_d3_reference_projectors(self) -> list[SimpleNamespace]:
         if self._m_valley_c2_reference_symmetry is None:
@@ -3313,10 +3339,19 @@ class BandStructureCalculator:
         samk = self.cal_TAPW_hamiltonian_k_cpu(s_full, tapw_parameters=tapw_parameters)
         return hamk, samk
 
-    def _project_full_space_matrix_with_projector(self, full_matrix, projector):
+    def _project_full_space_matrix_with_projector(self, full_matrix, projector, force_sparse_dot: bool = False):
         if scipy.sparse.issparse(projector):
             projector = projector.tocsr()
             projector_h = projector.conj().T.tocsr()
+            use_sparse_dot = bool(force_sparse_dot or getattr(self.config, "use_sparse_dot_mkl", False))
+            if (
+                use_sparse_dot
+                and _HAS_SPARSE_DOT_MKL
+                and scipy.sparse.issparse(full_matrix)
+            ):
+                tmp = dot_product_mkl(projector, full_matrix, dense=False)
+                out = dot_product_mkl(tmp, projector_h, dense=True)
+                return np.asarray(out)
             result = projector @ full_matrix @ projector_h
             return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
 
@@ -3324,16 +3359,16 @@ class BandStructureCalculator:
         full_matrix = full_matrix.toarray() if scipy.sparse.issparse(full_matrix) else np.asarray(full_matrix)
         return np.asarray(projector @ full_matrix @ projector.conj().T)
 
-    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector):
+    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector, force_sparse_dot: bool = False):
         h_full = self.Getk_super_gauge_sparse(Hr, k, type="H")
-        hamk = self._project_full_space_matrix_with_projector(h_full, projector)
+        hamk = self._project_full_space_matrix_with_projector(h_full, projector, force_sparse_dot=force_sparse_dot)
 
         orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
         if orthogonal_basis:
             return hamk, None
 
         s_full = self.Getk_super_gauge_sparse(Sr, k, type="S")
-        samk = self._project_full_space_matrix_with_projector(s_full, projector)
+        samk = self._project_full_space_matrix_with_projector(s_full, projector, force_sparse_dot=force_sparse_dot)
         return hamk, samk
 
     def _finalize_tapw_projected_hs(self, hamk, samk, mpi_index):
@@ -3354,32 +3389,41 @@ class BandStructureCalculator:
         return self._finalize_tapw_projected_hs(hamk, samk, mpi_index)
 
     def _calculate_reference_m_valley_c3_hs(self, k_reference, mpi_index):
-        raw_hs = {}
-        for valley in _M_VALLEY_TRIPLET:
-            local_k = rotate_local_k_between_m_valleys(
+        if not getattr(self, "_m_valley_c3_reference_projectors", None):
+            self._m_valley_c3_reference_projectors = self._build_m_valley_c3_reference_projectors()
+
+        orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
+        h_sum = None
+        s_sum = None
+
+        for projector_term in self._m_valley_c3_reference_projectors:
+            k_transformed = transform_k_by_cartesian_linear_map(
                 k_reference,
                 self.structure.reciprocal_Tmat,
-                source_valley=self._m_valley_reference,
-                target_valley=valley,
+                projector_term.linear_map_2d,
             )
-            raw_hs[valley] = self._get_raw_tapw_projected_hs_for_parameters(
+            hamk, samk = self._get_raw_projected_hs_with_projector(
                 self.hr_supercell,
                 self.sr_supercell,
-                local_k,
+                k_transformed,
                 mpi_index,
-                self._m_valley_parameters[valley],
+                projector_term.projector,
+                force_sparse_dot=True,
             )
+            h_sum = np.array(hamk, copy=True) if h_sum is None else (h_sum + hamk)
+            if orthogonal_basis:
+                continue
+            if samk is None:
+                raise ValueError("Reference M-valley C3 averaging requires overlap matrices in non-orthogonal mode.")
+            s_sum = np.array(samk, copy=True) if s_sum is None else (s_sum + samk)
 
-        return threefold_reference_hs_average(
-            raw_hs[31][0],
-            raw_hs[31][1],
-            raw_hs[32][0],
-            raw_hs[32][1],
-            raw_hs[33][0],
-            raw_hs[33][1],
-            self._m_valley_transport_valley_to_ref[32],
-            self._m_valley_transport_valley_to_ref[33],
-        )
+        count = float(len(self._m_valley_c3_reference_projectors))
+        h_avg = h_sum / count
+        if orthogonal_basis:
+            return h_avg, None
+        if s_sum is None:
+            raise ValueError("Reference M-valley C3 averaging did not accumulate any overlap matrices.")
+        return h_avg, s_sum / count
 
     def _calculate_reference_m_valley_d3_hs(self, k_reference, mpi_index):
         if not self._m_valley_d3_reference_projectors:
@@ -3431,6 +3475,16 @@ class BandStructureCalculator:
             h_ref_sym, s_ref_sym = self._calculate_reference_m_valley_c3_hs(k_reference, mpi_index)
 
         if self.config.valley == self._m_valley_reference:
+            return self._finalize_tapw_projected_hs(h_ref_sym, s_ref_sym, mpi_index)
+
+        # For eigenvalue-only band runs, transporting the averaged reference H/S into the
+        # target M-valley basis is unnecessary: the generalized eigenvalues are invariant
+        # under this basis change. Skipping the dense transport removes pure overhead.
+        if (
+            not getattr(self, "use_M_valley_d3_symm", False)
+            and not getattr(self.config, "eig_vec_cal", False)
+            and not getattr(self.config, "hamk_save", False)
+        ):
             return self._finalize_tapw_projected_hs(h_ref_sym, s_ref_sym, mpi_index)
 
         transport = self._m_valley_transport_ref_to_valley[self.config.valley]
