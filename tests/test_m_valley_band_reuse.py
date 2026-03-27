@@ -7,7 +7,7 @@ from tapw.cal_ham_01 import BandStructureCalculator
 from tapw.main import can_reuse_m_valley_c3_band_outputs, copy_reused_m_valley_band_outputs
 
 
-def test_can_reuse_m_valley_c3_band_outputs_only_for_eigenvalue_only_band_triplet():
+def test_can_reuse_m_valley_c3_band_outputs_is_disabled_by_default():
     cfg = SimpleNamespace(
         mode="band",
         TAPW=True,
@@ -19,24 +19,6 @@ def test_can_reuse_m_valley_c3_band_outputs_only_for_eigenvalue_only_band_triple
         bravais="hex",
     )
 
-    assert can_reuse_m_valley_c3_band_outputs(cfg) is True
-
-    cfg.eig_vec_cal = True
-    assert can_reuse_m_valley_c3_band_outputs(cfg) is False
-
-    cfg.eig_vec_cal = False
-    cfg.hamk_save = True
-    assert can_reuse_m_valley_c3_band_outputs(cfg) is False
-
-    cfg.hamk_save = False
-    cfg.M_valley_D3_H = True
-    assert can_reuse_m_valley_c3_band_outputs(cfg) is False
-
-    cfg.M_valley_D3_H = False
-    cfg.valleys = [31]
-    assert can_reuse_m_valley_c3_band_outputs(cfg) is False
-
-    cfg.valleys = [31, 1]
     assert can_reuse_m_valley_c3_band_outputs(cfg) is False
 
 

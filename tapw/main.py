@@ -81,18 +81,9 @@ def parse_args():
 
 
 def can_reuse_m_valley_c3_band_outputs(compute_cfg) -> bool:
-    valleys = list(getattr(compute_cfg, "valleys", []) or [])
-    return bool(
-        getattr(compute_cfg, "mode", None) == "band"
-        and getattr(compute_cfg, "TAPW", False)
-        and getattr(compute_cfg, "C3_H", False)
-        and not getattr(compute_cfg, "M_valley_D3_H", False)
-        and not getattr(compute_cfg, "eig_vec_cal", False)
-        and not getattr(compute_cfg, "hamk_save", False)
-        and len(valleys) > 1
-        and all(valley in (31, 32, 33) for valley in valleys)
-        and str(getattr(compute_cfg, "bravais", "hex")).lower() == "hex"
-    )
+    # Disabled by default. Real ZnI2 M-valley C3-only outputs show that the saved band
+    # files for M1/M2/M3 are not identical, so direct file reuse is scientifically unsafe.
+    return False
 
 
 def copy_reused_m_valley_band_outputs(qshell_path: Path, source_valley_flag: str, target_valley_flag: str) -> None:
