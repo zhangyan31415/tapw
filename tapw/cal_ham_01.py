@@ -8,9 +8,11 @@ import scipy.linalg
 import scipy.sparse
 from scipy.sparse.linalg import eigsh
 from scipy.linalg import det
+from scipy.spatial import cKDTree
 import time
 import os
 import sys
+import copy
 import multiprocessing as mp
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -18,11 +20,22 @@ from types import SimpleNamespace
 from numpy.lib.format import open_memmap
 from joblib import Parallel, delayed
 import joblib.parallel as joblib_parallel
-from .C3_symm_01 import C3_MoTe2_all, C3_G_matrix
+from .C3_symm_01 import (
+    C3_MoTe2_all,
+    C3_G_matrix,
+    direct_sum,
+    generate_direct_sum_params,
+    rot_matrix,
+    single_valley_c3_incompatibility_reason,
+    spin_reps,
+    supports_single_valley_c3,
+    rotate_mat,
+)
 from tqdm import tqdm
 from .config import ComputeConfig
 from .read_pos_01 import StructureProcessorSpglib
 from .read_kpath_01 import KPathGenerator
+from .rot_matrix import get_any_rot_orb_twostep
 from .utils import (
     timing_decorator_factory, rotate_vector, unique_sorted, 
     check_hermitian, is_positive_definite, print_sparse_matrix_info, 
@@ -62,6 +75,1094 @@ _NOTAPW_SLEPC_FACTOR_CANDIDATES = (
 _NOTAPW_SLEPC_SPD_SHIFT = 1.0e-10
 _NOTAPW_SLEPC_TOL = 1.0e-8
 _NOTAPW_SLEPC_MAX_IT = 5000
+_M_VALLEY_TRIPLET = (31, 32, 33)
+_M_VALLEY_ROTATIONS = {31: 0, 32: 120, 33: 240}
+_SIGMA_Y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=np.complex128)
+
+
+def uses_m_valley_threefold_symmetrization(config: ComputeConfig) -> bool:
+    bravais = getattr(config, "bravais", "hex")
+    return bool(
+        getattr(config, "TAPW", False)
+        and getattr(config, "C3_H", False)
+        and str(bravais).lower() == "hex"
+        and getattr(config, "valley", None) in _M_VALLEY_TRIPLET
+    )
+
+
+def uses_m_valley_d3_symmetrization(config: ComputeConfig) -> bool:
+    return bool(
+        uses_m_valley_threefold_symmetrization(config)
+        and getattr(config, "M_valley_D3_H", False)
+    )
+
+
+def rotate_local_k_between_m_valleys(k_local, reciprocal_tmat, source_valley: int, target_valley: int):
+    if source_valley not in _M_VALLEY_ROTATIONS or target_valley not in _M_VALLEY_ROTATIONS:
+        raise ValueError(f"M-valley rotation only supports {_M_VALLEY_TRIPLET}, got {source_valley}->{target_valley}")
+
+    reciprocal_tmat = np.asarray(reciprocal_tmat, dtype=float)
+    k_local_arr = np.asarray(k_local, dtype=float)
+    if k_local_arr.shape == (2,):
+        k_local_arr = np.array([k_local_arr[0], k_local_arr[1], 0.0], dtype=float)
+    elif k_local_arr.shape != (3,):
+        raise ValueError(f"k_local must have shape (2,) or (3,), got {k_local_arr.shape}")
+
+    delta_angle = _M_VALLEY_ROTATIONS[target_valley] - _M_VALLEY_ROTATIONS[source_valley]
+    k_cart = np.dot(k_local_arr, reciprocal_tmat)
+    k_cart_rot = np.array(k_cart, copy=True)
+    k_cart_rot[:2] = rotate_vector(k_cart[:2], delta_angle)
+    return np.linalg.solve(reciprocal_tmat.T, k_cart_rot)
+
+
+def transport_matrix_between_m_valleys(matrix: np.ndarray, transport: np.ndarray) -> np.ndarray:
+    return transport @ matrix @ transport.conj().T
+
+
+def transform_k_by_cartesian_linear_map(k_local, reciprocal_tmat, linear_map: np.ndarray):
+    reciprocal_tmat = np.asarray(reciprocal_tmat, dtype=float)
+    linear_map = np.asarray(linear_map, dtype=float)
+    k_local_arr = np.asarray(k_local, dtype=float)
+    if k_local_arr.shape == (2,):
+        k_local_arr = np.array([k_local_arr[0], k_local_arr[1], 0.0], dtype=float)
+    elif k_local_arr.shape != (3,):
+        raise ValueError(f"k_local must have shape (2,) or (3,), got {k_local_arr.shape}")
+    if linear_map.shape != (2, 2):
+        raise ValueError(f"linear_map must have shape (2, 2), got {linear_map.shape}")
+
+    k_cart = np.dot(k_local_arr, reciprocal_tmat)
+    k_cart_transformed = np.array(k_cart, copy=True)
+    k_cart_transformed[:2] = linear_map @ k_cart[:2]
+    return np.linalg.solve(reciprocal_tmat.T, k_cart_transformed)
+
+
+def threefold_reference_hs_average(
+    h_ref: np.ndarray,
+    s_ref: np.ndarray | None,
+    h_c1: np.ndarray,
+    s_c1: np.ndarray | None,
+    h_c2: np.ndarray,
+    s_c2: np.ndarray | None,
+    u_c1_to_ref: np.ndarray,
+    u_c2_to_ref: np.ndarray,
+):
+    h_avg = (
+        h_ref
+        + transport_matrix_between_m_valleys(h_c1, u_c1_to_ref)
+        + transport_matrix_between_m_valleys(h_c2, u_c2_to_ref)
+    ) / 3.0
+
+    if s_ref is None:
+        return h_avg, None
+
+    if s_c1 is None or s_c2 is None:
+        raise ValueError("S-matrix averaging requires s_ref, s_c1, and s_c2 together.")
+
+    s_avg = (
+        s_ref
+        + transport_matrix_between_m_valleys(s_c1, u_c1_to_ref)
+        + transport_matrix_between_m_valleys(s_c2, u_c2_to_ref)
+    ) / 3.0
+    return h_avg, s_avg
+
+
+def twofold_reference_hs_average(
+    h_ref: np.ndarray,
+    s_ref: np.ndarray | None,
+    h_partner: np.ndarray,
+    s_partner: np.ndarray | None,
+    u_c2_ref: np.ndarray,
+    antiunitary: bool = False,
+):
+    partner_h = h_partner.conj() if antiunitary else h_partner
+    h_avg = 0.5 * (h_ref + transport_matrix_between_m_valleys(partner_h, u_c2_ref))
+
+    if s_ref is None:
+        return h_avg, None
+
+    if s_partner is None:
+        raise ValueError("S-matrix averaging requires s_ref and s_partner together.")
+
+    partner_s = s_partner.conj() if antiunitary else s_partner
+    s_avg = 0.5 * (s_ref + transport_matrix_between_m_valleys(partner_s, u_c2_ref))
+    return h_avg, s_avg
+
+
+def _m_valley_rotation_delta(source_valley: int, target_valley: int) -> int:
+    if source_valley not in _M_VALLEY_ROTATIONS or target_valley not in _M_VALLEY_ROTATIONS:
+        raise ValueError(f"M-valley rotation only supports {_M_VALLEY_TRIPLET}, got {source_valley}->{target_valley}")
+    return (_M_VALLEY_ROTATIONS[target_valley] - _M_VALLEY_ROTATIONS[source_valley]) % 360
+
+
+def _parse_orbitals_from_orb_name(orb_name: str):
+    if not isinstance(orb_name, str):
+        raise ValueError(f"orb_name must be str, got {type(orb_name)}")
+    if "-" in orb_name:
+        _, orb_part = orb_name.split("-", 1)
+    else:
+        orb_part = orb_name
+    orbitals = {}
+    for orb, count in re.findall(r"([spdf])(\d+)", orb_part):
+        orbitals[orb] = int(count)
+    if len(orbitals) == 0:
+        raise ValueError(f"Cannot parse orbitals from orb_name='{orb_name}'")
+    return orbitals
+
+
+def _build_group_orbital_rotation_blocks(structure_df, angle_deg: int, spin: bool):
+    rotation_matrix = rot_matrix(angle_deg)
+    return _build_group_orbital_rotation_blocks_from_rotation_matrix(
+        structure_df=structure_df,
+        rotation_matrix=rotation_matrix,
+        spin=spin,
+        spin_rep=None,
+    )
+
+
+def _build_group_orbital_rotation_blocks_from_rotation_matrix(
+    structure_df,
+    rotation_matrix: np.ndarray,
+    spin: bool,
+    spin_rep: np.ndarray | None = None,
+):
+    orb_mapping = {
+        "s": get_any_rot_orb_twostep("s", rotation_matrix),
+        "p": get_any_rot_orb_twostep("p", rotation_matrix),
+        "d": get_any_rot_orb_twostep("d", rotation_matrix),
+        "f": get_any_rot_orb_twostep("f", rotation_matrix),
+    }
+
+    if spin and spin_rep is None:
+        spin_rep = spin_reps(rotation_matrix)
+
+    df_temp = structure_df.copy()
+    atom_type_list_global = np.unique(df_temp["atom_type"].values)
+    unique_groups = sorted(df_temp["twist_group"].unique().tolist())
+    group_blocks = []
+    for gid in unique_groups:
+        df_g = df_temp[df_temp["twist_group"] == gid]
+        if df_g.empty:
+            raise ValueError(f"No atoms found for twist_group={gid}")
+        group_atom_types = [at for at in atom_type_list_global if (df_g["atom_type"] == at).any()]
+        type_blocks = []
+        for at in group_atom_types:
+            orb_name = df_g.loc[df_g["atom_type"] == at, "orb_name"].iloc[0]
+            orbitals_dict = _parse_orbitals_from_orb_name(orb_name)
+            params = generate_direct_sum_params(orbitals_dict, orb_mapping)
+            type_blocks.append(direct_sum(*params))
+        group_blocks.append(direct_sum(*type_blocks))
+    return group_blocks, spin_rep if spin else None
+
+
+def select_reference_m_valley_c2_operation(
+    lattice: np.ndarray,
+    rotations,
+    translations,
+    invariant_k_cart,
+    invariance_tol: float = 1.0e-6,
+):
+    lattice = np.asarray(lattice, dtype=float)
+    if lattice.shape != (3, 3):
+        raise ValueError(f"lattice must have shape (3, 3), got {lattice.shape}")
+
+    invariant_k_cart = np.asarray(invariant_k_cart, dtype=float)
+    if invariant_k_cart.shape != (2,):
+        raise ValueError(f"invariant_k_cart must have shape (2,), got {invariant_k_cart.shape}")
+
+    lattice_inv_t = np.linalg.inv(lattice.T)
+    best_candidate = None
+
+    for idx, (rotation_frac, translation_frac) in enumerate(zip(rotations, translations)):
+        rotation_frac = np.asarray(rotation_frac, dtype=float)
+        translation_frac = np.asarray(translation_frac, dtype=float)
+        if rotation_frac.shape != (3, 3):
+            raise ValueError(f"rotation matrix at index {idx} must have shape (3, 3), got {rotation_frac.shape}")
+        if translation_frac.shape != (3,):
+            raise ValueError(
+                f"translation vector at index {idx} must have shape (3,), got {translation_frac.shape}"
+            )
+
+        if np.allclose(rotation_frac, np.eye(3), atol=1.0e-12):
+            continue
+        if not np.allclose(rotation_frac @ rotation_frac, np.eye(3), atol=1.0e-12):
+            continue
+
+        det_rot = round(float(np.linalg.det(rotation_frac)))
+        if det_rot != 1:
+            continue
+
+        rotation_cart = lattice.T @ rotation_frac @ lattice_inv_t
+        linear_map = rotation_cart[:2, :2]
+        score = float(np.linalg.norm(linear_map @ invariant_k_cart - invariant_k_cart))
+        if best_candidate is None or score < best_candidate[0]:
+            best_candidate = (score, idx, linear_map, rotation_cart, translation_frac)
+
+    if best_candidate is None:
+        raise ValueError("Could not find a proper order-2 symmetry operation for the reference M-valley C2.")
+    if best_candidate[0] > invariance_tol:
+        raise ValueError(
+            "Could not find a reference M-valley C2 operation that leaves the chosen M point invariant; "
+            + f"best invariance error is {best_candidate[0]:.3e}."
+        )
+
+    _, idx, linear_map, rotation_cart, translation_frac = best_candidate
+    return idx, linear_map, rotation_cart, translation_frac
+
+
+def _cartesian_positions_to_fractional(lattice: np.ndarray, cartesian_positions: np.ndarray) -> np.ndarray:
+    lattice = np.asarray(lattice, dtype=float)
+    cartesian_positions = np.asarray(cartesian_positions, dtype=float)
+    if lattice.shape != (3, 3):
+        raise ValueError(f"lattice must have shape (3, 3), got {lattice.shape}")
+    if cartesian_positions.ndim != 2 or cartesian_positions.shape[1] != 3:
+        raise ValueError(
+            f"cartesian_positions must have shape (N, 3), got {cartesian_positions.shape}"
+        )
+    frac = np.linalg.solve(lattice.T, cartesian_positions.T).T
+    return frac - np.floor(frac)
+
+
+def map_atom_types_by_fractional_symmetry(
+    structure_df,
+    lattice: np.ndarray,
+    rotation_frac: np.ndarray,
+    translation_frac: np.ndarray,
+    source_group: int,
+    target_group: int,
+    tol: float = 5.0e-6,
+):
+    required_columns = {"x", "y", "z", "species", "atom_type", "twist_group"}
+    missing = required_columns.difference(structure_df.columns)
+    if missing:
+        raise ValueError(
+            "structure_df is missing columns required for fractional symmetry mapping: "
+            + ", ".join(sorted(missing))
+        )
+
+    df_temp = structure_df.copy().reset_index(drop=True)
+    lattice = np.asarray(lattice, dtype=float)
+    rotation_frac = np.asarray(rotation_frac, dtype=float)
+    translation_frac = np.asarray(translation_frac, dtype=float)
+    positions_frac = _cartesian_positions_to_fractional(
+        lattice,
+        df_temp[["x", "y", "z"]].to_numpy(dtype=float),
+    )
+
+    source_mask = df_temp["twist_group"] == source_group
+    target_mask = df_temp["twist_group"] == target_group
+    if not np.any(source_mask) or not np.any(target_mask):
+        raise ValueError(f"Missing atoms for twist_group pair {source_group}->{target_group}.")
+
+    source_atom_types = sorted(df_temp.loc[source_mask, "atom_type"].astype(int).unique().tolist())
+    mapping: dict[int, int] = {}
+    used_target_atom_types: set[int] = set()
+
+    for source_atom_type in source_atom_types:
+        source_rows = np.flatnonzero(
+            source_mask.to_numpy() & (df_temp["atom_type"].to_numpy() == source_atom_type)
+        )
+        if source_rows.size == 0:
+            continue
+
+        species = df_temp.loc[source_rows[0], "species"]
+        target_rows = np.flatnonzero(
+            target_mask.to_numpy() & (df_temp["species"].to_numpy() == species)
+        )
+        if target_rows.size == 0:
+            raise ValueError(
+                f"No target-group atoms with species={species!r} for source atom_type={source_atom_type}."
+            )
+
+        target_frac = positions_frac[target_rows]
+        target_images = []
+        target_lookup = []
+        for n1 in (-1, 0, 1):
+            for n2 in (-1, 0, 1):
+                shift = np.array([float(n1), float(n2), 0.0], dtype=float)
+                target_images.append(target_frac + shift)
+                target_lookup.append(target_rows)
+        target_images_arr = np.concatenate(target_images, axis=0)
+        target_lookup_arr = np.concatenate(target_lookup, axis=0)
+
+        transformed_frac = (positions_frac[source_rows] @ rotation_frac.T) + translation_frac
+        transformed_frac = transformed_frac - np.floor(transformed_frac)
+        distances, matched = cKDTree(target_images_arr).query(transformed_frac, k=1)
+        matched = np.asarray(matched, dtype=int)
+        if np.any(distances > tol):
+            raise ValueError(
+                f"Fractional symmetry mapping {source_group}->{target_group} failed for source atom_type="
+                f"{source_atom_type}: max mismatch={float(np.max(distances)):.3e}"
+            )
+
+        matched_target_rows = target_lookup_arr[matched]
+        if len(np.unique(matched_target_rows)) != len(source_rows):
+            raise ValueError(
+                f"Fractional symmetry mapping {source_group}->{target_group} is not one-to-one for "
+                f"source atom_type={source_atom_type}."
+            )
+
+        matched_target_types = np.unique(df_temp.loc[matched_target_rows, "atom_type"].astype(int).to_numpy())
+        if matched_target_types.size != 1:
+            raise ValueError(
+                f"Fractional symmetry mapping {source_group}->{target_group} sends source atom_type="
+                f"{source_atom_type} to multiple target atom types {matched_target_types.tolist()}."
+            )
+
+        target_atom_type = int(matched_target_types[0])
+        if target_atom_type in used_target_atom_types:
+            raise ValueError(
+                f"Fractional symmetry mapping {source_group}->{target_group} reuses target atom_type="
+                f"{target_atom_type}."
+            )
+        used_target_atom_types.add(target_atom_type)
+        mapping[int(source_atom_type)] = target_atom_type
+
+    return mapping
+
+
+def resolve_reference_m_valley_c2_symmetry(structure, reference_params, symprec: float = 1.0e-3):
+    if getattr(reference_params, "valley", None) not in _M_VALLEY_TRIPLET:
+        raise ValueError(f"Reference C2 symmetry only supports M valleys {_M_VALLEY_TRIPLET}.")
+    if not hasattr(structure, "df") or structure.df is None:
+        raise ValueError("structure must provide a populated df for reference M-valley C2 symmetry.")
+    if not hasattr(structure, "Tmat"):
+        raise ValueError("structure must provide Tmat for reference M-valley C2 symmetry.")
+
+    try:
+        import spglib  # type: ignore
+    except ImportError as exc:
+        raise ImportError("spglib is required for reference M-valley C2 symmetry resolution.") from exc
+
+    try:
+        from ase.data import atomic_numbers  # type: ignore
+    except ImportError as exc:
+        raise ImportError("ase is required for reference M-valley C2 symmetry resolution.") from exc
+
+    structure_df = structure.df.copy().reset_index(drop=True)
+    required_columns = {"x", "y", "z", "species", "twist_group", "atom_type"}
+    missing = required_columns.difference(structure_df.columns)
+    if missing:
+        raise ValueError(
+            "structure.df is missing columns required for reference M-valley C2 symmetry: "
+            + ", ".join(sorted(missing))
+        )
+
+    lattice = np.asarray(structure.Tmat, dtype=float)
+    positions_frac = _cartesian_positions_to_fractional(
+        lattice,
+        structure_df[["x", "y", "z"]].to_numpy(dtype=float),
+    )
+
+    try:
+        numbers = np.asarray(
+            [atomic_numbers[str(species)] for species in structure_df["species"].tolist()],
+            dtype=int,
+        )
+    except KeyError as exc:
+        raise ValueError(f"Unknown chemical species {exc.args[0]!r} in structure.df for spglib mapping.") from exc
+
+    symmetry = spglib.get_symmetry((lattice, positions_frac, numbers), symprec=symprec)
+    if symmetry is None:
+        raise ValueError(f"spglib.get_symmetry failed for reference M-valley C2 resolution with symprec={symprec}.")
+
+    _, _, m_k1, _, _ = reference_params.calculate_K_points()
+    operation_index, linear_map_2d, rotation_cart, translation_frac = select_reference_m_valley_c2_operation(
+        lattice=lattice,
+        rotations=symmetry["rotations"],
+        translations=symmetry["translations"],
+        invariant_k_cart=np.asarray(m_k1, dtype=float),
+    )
+
+    rotation_frac = np.asarray(symmetry["rotations"][operation_index], dtype=float)
+    translation_frac = np.asarray(translation_frac, dtype=float)
+    atom_type_map_0_to_1 = map_atom_types_by_fractional_symmetry(
+        structure_df=structure_df,
+        lattice=lattice,
+        rotation_frac=rotation_frac,
+        translation_frac=translation_frac,
+        source_group=0,
+        target_group=1,
+    )
+    atom_type_map_1_to_0 = map_atom_types_by_fractional_symmetry(
+        structure_df=structure_df,
+        lattice=lattice,
+        rotation_frac=rotation_frac,
+        translation_frac=translation_frac,
+        source_group=1,
+        target_group=0,
+    )
+
+    return SimpleNamespace(
+        operation_index=int(operation_index),
+        rotation_frac=rotation_frac,
+        translation_frac=translation_frac,
+        rotation_cart=np.asarray(rotation_cart, dtype=float),
+        translation_cart=np.asarray(lattice.T @ translation_frac, dtype=float),
+        linear_map_2d=np.asarray(linear_map_2d, dtype=float),
+        atom_type_map_0_to_1=atom_type_map_0_to_1,
+        atom_type_map_1_to_0=atom_type_map_1_to_0,
+    )
+
+
+def reference_m_valley_c2_spin_unitary(rotation_matrix: np.ndarray) -> np.ndarray:
+    rotation_matrix = np.asarray(rotation_matrix, dtype=float)
+    if rotation_matrix.shape != (3, 3):
+        raise ValueError(f"rotation_matrix must have shape (3, 3), got {rotation_matrix.shape}")
+    return spin_reps(rotation_matrix) @ (1.0j * _SIGMA_Y)
+
+
+def _build_group_orbital_transport_between_groups(
+    structure_df,
+    source_group: int,
+    target_group: int,
+    rotation_matrix: np.ndarray,
+    spin: bool,
+    spin_rep: np.ndarray | None = None,
+    target_for_source: dict[int, int] | None = None,
+):
+    orb_mapping = {
+        "s": get_any_rot_orb_twostep("s", rotation_matrix),
+        "p": get_any_rot_orb_twostep("p", rotation_matrix),
+        "d": get_any_rot_orb_twostep("d", rotation_matrix),
+        "f": get_any_rot_orb_twostep("f", rotation_matrix),
+    }
+
+    if spin and spin_rep is None:
+        spin_rep = spin_reps(rotation_matrix)
+
+    df_temp = structure_df.copy()
+    atom_type_list_global = np.unique(df_temp["atom_type"].values)
+    df_source = df_temp[df_temp["twist_group"] == source_group]
+    df_target = df_temp[df_temp["twist_group"] == target_group]
+    if df_source.empty or df_target.empty:
+        raise ValueError(f"Missing atoms for twist_group pair {source_group}->{target_group}.")
+
+    source_atom_types = [at for at in atom_type_list_global if (df_source["atom_type"] == at).any()]
+    target_atom_types = [at for at in atom_type_list_global if (df_target["atom_type"] == at).any()]
+    if len(source_atom_types) != len(target_atom_types):
+        raise ValueError(
+                "Reference M-valley C2 transport requires matched atom-type counts across the two twist groups; "
+                + f"got {len(source_atom_types)} and {len(target_atom_types)}."
+        )
+
+    if target_for_source is not None:
+        target_for_source = {int(k): int(v) for k, v in target_for_source.items()}
+        missing_source_types = sorted(set(source_atom_types).difference(target_for_source))
+        if missing_source_types:
+            raise ValueError(
+                "Explicit source->target atom-type map is missing entries for source atom types "
+                + f"{missing_source_types}."
+            )
+    elif "z" in df_temp.columns:
+        def _rep_z(df_group, atom_type):
+            return float(df_group.loc[df_group["atom_type"] == atom_type, "z"].iloc[0])
+
+        source_by_z = sorted(source_atom_types, key=lambda at: _rep_z(df_source, at))
+        target_by_z = sorted(target_atom_types, key=lambda at: _rep_z(df_target, at), reverse=True)
+        target_for_source = dict(zip(source_by_z, target_by_z))
+    else:
+        target_for_source = dict(zip(source_atom_types, target_atom_types))
+
+    source_offsets = {}
+    source_blocks = {}
+    source_dim_total = 0
+    for atom_type in source_atom_types:
+        orb_name = df_source.loc[df_source["atom_type"] == atom_type, "orb_name"].iloc[0]
+        orbitals_dict = _parse_orbitals_from_orb_name(orb_name)
+        params = generate_direct_sum_params(orbitals_dict, orb_mapping)
+        block = direct_sum(*params)
+        source_offsets[atom_type] = (source_dim_total, block.shape[0], orbitals_dict)
+        source_blocks[atom_type] = block
+        source_dim_total += block.shape[0]
+
+    target_offsets = {}
+    target_dim_total = 0
+    for atom_type in target_atom_types:
+        orb_name = df_target.loc[df_target["atom_type"] == atom_type, "orb_name"].iloc[0]
+        orbitals_dict = _parse_orbitals_from_orb_name(orb_name)
+        target_block = direct_sum(*generate_direct_sum_params(orbitals_dict, orb_mapping))
+        target_offsets[atom_type] = (target_dim_total, target_block.shape[0], orbitals_dict)
+        target_dim_total += target_block.shape[0]
+
+    transport = np.zeros((target_dim_total, source_dim_total), dtype=np.complex128)
+    for source_atom_type in source_atom_types:
+        target_atom_type = target_for_source[source_atom_type]
+        source_start, source_dim, source_orbitals = source_offsets[source_atom_type]
+        target_start, target_dim, target_orbitals = target_offsets[target_atom_type]
+        if source_dim != target_dim or source_orbitals != target_orbitals:
+            raise ValueError(
+                "Reference M-valley C2 transport requires matched orbital blocks across mapped atom types; "
+                + f"source atom_type={source_atom_type} {source_orbitals} vs "
+                + f"target atom_type={target_atom_type} {target_orbitals}."
+            )
+        transport[target_start : target_start + target_dim, source_start : source_start + source_dim] = source_blocks[
+            source_atom_type
+        ]
+
+    return transport, spin_rep if spin else None
+
+
+def _build_rotation_match_matrix(source_gvecs, target_gvecs, angle_deg: int, tol: float = 1.0e-2):
+    source = np.asarray(source_gvecs, dtype=float)
+    target = np.asarray(target_gvecs, dtype=float)
+    if source.shape != target.shape:
+        raise ValueError(f"G-vector lists must have the same shape, got {source.shape} and {target.shape}")
+    if source.ndim != 2 or source.shape[1] != 2:
+        raise ValueError(f"G-vector lists must have shape (N, 2), got {source.shape}")
+
+    rotated_source = np.array([rotate_vector(vec, angle_deg) for vec in source], dtype=float)
+    matrix = np.zeros((target.shape[0], source.shape[0]), dtype=np.complex128)
+    used_targets: set[int] = set()
+
+    for source_index, rotated_vec in enumerate(rotated_source):
+        deltas = np.linalg.norm(target - rotated_vec, axis=1)
+        target_index = int(np.argmin(deltas))
+        if deltas[target_index] > tol:
+            raise ValueError(
+                f"Cannot match rotated G-vector at index {source_index}: min delta={deltas[target_index]:.3e}"
+            )
+        if target_index in used_targets:
+            raise ValueError(f"Rotation map is not one-to-one; repeated target index {target_index}")
+        used_targets.add(target_index)
+        matrix[target_index, source_index] = 1.0
+
+    return matrix
+
+
+def _build_linear_match_matrix(source_gvecs, target_gvecs, linear_map: np.ndarray, tol: float = 1.0e-2):
+    source = np.asarray(source_gvecs, dtype=float)
+    target = np.asarray(target_gvecs, dtype=float)
+    linear_map = np.asarray(linear_map, dtype=float)
+    if source.shape != target.shape:
+        raise ValueError(f"G-vector lists must have the same shape, got {source.shape} and {target.shape}")
+    if source.ndim != 2 or source.shape[1] != 2:
+        raise ValueError(f"G-vector lists must have shape (N, 2), got {source.shape}")
+    if linear_map.shape != (2, 2):
+        raise ValueError(f"linear_map must have shape (2, 2), got {linear_map.shape}")
+
+    transformed_source = (linear_map @ source.T).T
+    matrix = np.zeros((target.shape[0], source.shape[0]), dtype=np.complex128)
+    used_targets: set[int] = set()
+
+    for source_index, transformed_vec in enumerate(transformed_source):
+        deltas = np.linalg.norm(target - transformed_vec, axis=1)
+        target_index = int(np.argmin(deltas))
+        if deltas[target_index] > tol:
+            raise ValueError(
+                f"Cannot match transformed G-vector at index {source_index}: min delta={deltas[target_index]:.3e}"
+            )
+        if target_index in used_targets:
+            raise ValueError(f"Linear map is not one-to-one; repeated target index {target_index}")
+        used_targets.add(target_index)
+        matrix[target_index, source_index] = 1.0
+
+    return matrix
+
+
+def build_reference_m_valley_c2_partner_projector(structure, reference_params, resolved_symmetry):
+    if getattr(reference_params, "valley", None) not in _M_VALLEY_TRIPLET:
+        raise ValueError(f"Reference C2 partner projector only supports M valleys {_M_VALLEY_TRIPLET}.")
+    if not hasattr(structure, "df") or structure.df is None:
+        raise ValueError("structure must provide a populated df for the reference M-valley C2 partner projector.")
+
+    required_cols = {"atom_type", "orb_num", "twist_group", "shifted_x", "shifted_y", "orb_name"}
+    missing = required_cols.difference(structure.df.columns)
+    if missing:
+        raise ValueError(
+            "structure.df is missing columns required for the reference M-valley C2 partner projector: "
+            + ", ".join(sorted(missing))
+        )
+
+    df_temp = structure.df.copy().sort_values(["atom_type"], kind="stable").reset_index(drop=True)
+    unique_groups = sorted(df_temp["twist_group"].unique().tolist())
+    if unique_groups != [0, 1]:
+        raise ValueError(
+            "Reference M-valley C2 partner projector currently supports bilayer twist_group=[0, 1], "
+            + f"got {unique_groups}."
+        )
+
+    atom_type_all = df_temp["atom_type"].to_numpy(dtype=int, copy=False)
+    orb_num_all = df_temp["orb_num"].to_numpy(dtype=int, copy=False)
+    twist_group_all = df_temp["twist_group"].to_numpy(dtype=int, copy=False)
+    pos_array = df_temp[["shifted_x", "shifted_y"]].to_numpy(dtype=float, copy=False)
+
+    atom_type_list = np.unique(atom_type_all)
+    if not np.array_equal(atom_type_list, np.arange(atom_type_list.size)):
+        raise ValueError(f"atom_type must be 0..n_types-1, got {atom_type_list}")
+
+    n_types = int(atom_type_list.size)
+    atom_orb_num_list = np.zeros(n_types, dtype=int)
+    atom_num_list = np.zeros(n_types, dtype=int)
+    atom_twist_group_list = np.zeros(n_types, dtype=int)
+    atom_orb_name_list = np.zeros(n_types, dtype=object)
+
+    for atom_type in range(n_types):
+        mask = atom_type_all == atom_type
+        if not np.any(mask):
+            raise ValueError(f"atom_type {atom_type} has no atoms")
+
+        atom_orb_num_list[atom_type] = int(orb_num_all[mask][0])
+        if not np.all(orb_num_all[mask] == atom_orb_num_list[atom_type]):
+            raise ValueError(f"Inconsistent orb_num for atom_type {atom_type}")
+
+        atom_num_list[atom_type] = int(np.sum(mask))
+        atom_twist_group_list[atom_type] = int(twist_group_all[mask][0])
+        if not np.all(twist_group_all[mask] == atom_twist_group_list[atom_type]):
+            raise ValueError(f"Inconsistent twist_group for atom_type {atom_type}")
+
+        atom_orb_name_list[atom_type] = df_temp.loc[mask, "orb_name"].iloc[0]
+
+    factor_list = 1.0 / np.sqrt(atom_num_list.astype(np.float64))
+    orb_group_num = np.zeros(2, dtype=int)
+    for group_id in range(2):
+        orb_group_num[group_id] = int(atom_orb_num_list[atom_twist_group_list == group_id].sum())
+
+    source_g_lists = {
+        0: np.asarray(reference_params.g_vec_list_K1, dtype=float),
+        1: np.asarray(reference_params.g_vec_list_K2, dtype=float),
+    }
+    g_group_num = np.array([len(source_g_lists[0]), len(source_g_lists[1])], dtype=int)
+
+    shift3 = np.zeros(2, dtype=int)
+    for group_id in range(2):
+        shift3[group_id] = int(np.dot(g_group_num[:group_id], orb_group_num[:group_id]))
+
+    shift1 = np.zeros(n_types, dtype=int)
+    for atom_type in range(n_types):
+        group_id = atom_twist_group_list[atom_type]
+        if atom_type > 0:
+            shift1[atom_type] = int(
+                atom_orb_num_list[:atom_type][atom_twist_group_list[:atom_type] == group_id].sum()
+            )
+
+    col_offsets = np.cumsum(np.r_[0, orb_num_all[:-1]]).astype(np.int64)
+    rotation_matrix = np.asarray(resolved_symmetry.rotation_cart, dtype=float)
+    if rotation_matrix.shape != (3, 3):
+        raise ValueError(
+            f"resolved_symmetry.rotation_cart must have shape (3, 3), got {rotation_matrix.shape}"
+        )
+
+    translation_cart = np.asarray(getattr(resolved_symmetry, "translation_cart", np.zeros(3)), dtype=float)
+    if translation_cart.shape != (3,):
+        raise ValueError(
+            f"resolved_symmetry.translation_cart must have shape (3,), got {translation_cart.shape}"
+        )
+
+    group_target_maps = {
+        0: {int(k): int(v) for k, v in getattr(resolved_symmetry, "atom_type_map_0_to_1").items()},
+        1: {int(k): int(v) for k, v in getattr(resolved_symmetry, "atom_type_map_1_to_0").items()},
+    }
+
+    orb_mapping = {
+        "s": get_any_rot_orb_twostep("s", rotation_matrix),
+        "p": get_any_rot_orb_twostep("p", rotation_matrix),
+        "d": get_any_rot_orb_twostep("d", rotation_matrix),
+        "f": get_any_rot_orb_twostep("f", rotation_matrix),
+    }
+
+    rows_parts: list[np.ndarray] = []
+    cols_parts: list[np.ndarray] = []
+    data_parts: list[np.ndarray] = []
+
+    for source_group in (0, 1):
+        target_group = 1 - source_group
+        source_atom_types = atom_type_list[atom_twist_group_list == source_group]
+        source_g_list = source_g_lists[source_group]
+        for gi, q_source in enumerate(source_g_list):
+            q_source = np.asarray(q_source, dtype=float)
+            q_target = rotation_matrix[:2, :2] @ q_source
+            translation_phase = np.exp(1.0j * np.dot(q_target, translation_cart[:2]))
+            group_row_shift = int(shift3[source_group] + gi * orb_group_num[source_group])
+
+            for source_atom_type in source_atom_types:
+                target_atom_type = group_target_maps[source_group][int(source_atom_type)]
+                source_orbitals = _parse_orbitals_from_orb_name(str(atom_orb_name_list[source_atom_type]))
+                target_orbitals = _parse_orbitals_from_orb_name(str(atom_orb_name_list[target_atom_type]))
+                if source_orbitals != target_orbitals:
+                    raise ValueError(
+                        "Reference M-valley C2 partner projector requires matched orbital content across mapped "
+                        + f"atom types; source atom_type={source_atom_type} {source_orbitals} vs "
+                        + f"target atom_type={target_atom_type} {target_orbitals}."
+                    )
+
+                orb_block = direct_sum(*generate_direct_sum_params(source_orbitals, orb_mapping))
+                row_block = orb_block.conj().T
+
+                orb_num = int(atom_orb_num_list[source_atom_type])
+                if row_block.shape != (orb_num, orb_num):
+                    raise ValueError(
+                        f"Orbital rotation block has shape {row_block.shape}, expected {(orb_num, orb_num)}."
+                    )
+
+                row_base = int(group_row_shift + shift1[source_atom_type])
+                row_idx = row_base + np.arange(orb_num, dtype=np.int64)
+                target_atom_idx = np.nonzero(
+                    (twist_group_all == target_group) & (atom_type_all == target_atom_type)
+                )[0]
+                if target_atom_idx.size == 0:
+                    raise ValueError(
+                        f"No target atoms found for mapped atom_type={target_atom_type} in twist_group={target_group}."
+                    )
+
+                phase_atoms = translation_phase * np.exp(-1.0j * (pos_array[target_atom_idx] @ q_target))
+                col_base = col_offsets[target_atom_idx]
+                for atom_phase, atom_col_base in zip(phase_atoms, col_base):
+                    rows_parts.append(np.repeat(row_idx, orb_num))
+                    cols_parts.append(
+                        np.tile(atom_col_base + np.arange(orb_num, dtype=np.int64), orb_num)
+                    )
+                    data_parts.append((atom_phase * factor_list[source_atom_type] * row_block).reshape(-1))
+
+    dim_rows = int(np.dot(g_group_num, orb_group_num))
+    dim_cols = int(np.sum(atom_num_list * atom_orb_num_list))
+    projector = scipy.sparse.coo_matrix(
+        (
+            np.concatenate(data_parts).astype(np.complex128, copy=False),
+            (np.concatenate(rows_parts), np.concatenate(cols_parts)),
+        ),
+        shape=(dim_rows, dim_cols),
+        dtype=np.complex128,
+    ).tocsr()
+    projector.sort_indices()
+
+    if getattr(structure, "spin", False):
+        spin_rep = spin_reps(rotation_matrix).conj().T
+        projector = scipy.sparse.csr_matrix(np.kron(spin_rep, projector.toarray()))
+    return projector
+
+
+def _build_reference_m_valley_transformed_projector(
+    structure,
+    reference_params,
+    rotation_matrix: np.ndarray,
+    group_target_maps: dict[int, dict[int, int]],
+    translation_cart: np.ndarray | None = None,
+):
+    if getattr(reference_params, "valley", None) not in _M_VALLEY_TRIPLET:
+        raise ValueError(f"Reference transformed projector only supports M valleys {_M_VALLEY_TRIPLET}.")
+    if not hasattr(structure, "df") or structure.df is None:
+        raise ValueError("structure must provide a populated df for the reference M-valley transformed projector.")
+
+    required_cols = {"atom_type", "orb_num", "twist_group", "shifted_x", "shifted_y", "orb_name"}
+    missing = required_cols.difference(structure.df.columns)
+    if missing:
+        raise ValueError(
+            "structure.df is missing columns required for the reference M-valley transformed projector: "
+            + ", ".join(sorted(missing))
+        )
+
+    df_temp = structure.df.copy().sort_values(["atom_type"], kind="stable").reset_index(drop=True)
+    unique_groups = sorted(df_temp["twist_group"].unique().tolist())
+    if unique_groups != [0, 1]:
+        raise ValueError(
+            "Reference M-valley transformed projector currently supports bilayer twist_group=[0, 1], "
+            + f"got {unique_groups}."
+        )
+
+    atom_type_all = df_temp["atom_type"].to_numpy(dtype=int, copy=False)
+    orb_num_all = df_temp["orb_num"].to_numpy(dtype=int, copy=False)
+    twist_group_all = df_temp["twist_group"].to_numpy(dtype=int, copy=False)
+    pos_array = df_temp[["shifted_x", "shifted_y"]].to_numpy(dtype=float, copy=False)
+
+    atom_type_list = np.unique(atom_type_all)
+    if not np.array_equal(atom_type_list, np.arange(atom_type_list.size)):
+        raise ValueError(f"atom_type must be 0..n_types-1, got {atom_type_list}")
+
+    n_types = int(atom_type_list.size)
+    atom_orb_num_list = np.zeros(n_types, dtype=int)
+    atom_num_list = np.zeros(n_types, dtype=int)
+    atom_twist_group_list = np.zeros(n_types, dtype=int)
+    atom_orb_name_list = np.zeros(n_types, dtype=object)
+
+    for atom_type in range(n_types):
+        mask = atom_type_all == atom_type
+        if not np.any(mask):
+            raise ValueError(f"atom_type {atom_type} has no atoms")
+
+        atom_orb_num_list[atom_type] = int(orb_num_all[mask][0])
+        if not np.all(orb_num_all[mask] == atom_orb_num_list[atom_type]):
+            raise ValueError(f"Inconsistent orb_num for atom_type {atom_type}")
+
+        atom_num_list[atom_type] = int(np.sum(mask))
+        atom_twist_group_list[atom_type] = int(twist_group_all[mask][0])
+        if not np.all(twist_group_all[mask] == atom_twist_group_list[atom_type]):
+            raise ValueError(f"Inconsistent twist_group for atom_type {atom_type}")
+
+        atom_orb_name_list[atom_type] = df_temp.loc[mask, "orb_name"].iloc[0]
+
+    factor_list = 1.0 / np.sqrt(atom_num_list.astype(np.float64))
+    orb_group_num = np.zeros(2, dtype=int)
+    for group_id in range(2):
+        orb_group_num[group_id] = int(atom_orb_num_list[atom_twist_group_list == group_id].sum())
+
+    source_g_lists = {
+        0: np.asarray(reference_params.g_vec_list_K1, dtype=float),
+        1: np.asarray(reference_params.g_vec_list_K2, dtype=float),
+    }
+    g_group_num = np.array([len(source_g_lists[0]), len(source_g_lists[1])], dtype=int)
+
+    shift3 = np.zeros(2, dtype=int)
+    for group_id in range(2):
+        shift3[group_id] = int(np.dot(g_group_num[:group_id], orb_group_num[:group_id]))
+
+    shift1 = np.zeros(n_types, dtype=int)
+    for atom_type in range(n_types):
+        group_id = atom_twist_group_list[atom_type]
+        if atom_type > 0:
+            shift1[atom_type] = int(
+                atom_orb_num_list[:atom_type][atom_twist_group_list[:atom_type] == group_id].sum()
+            )
+
+    normalized_group_maps = {
+        int(source_group): {int(k): int(v) for k, v in target_map.items()}
+        for source_group, target_map in group_target_maps.items()
+    }
+    for source_group in (0, 1):
+        if source_group not in normalized_group_maps:
+            raise ValueError(f"group_target_maps is missing source_group={source_group}.")
+
+    col_offsets = np.cumsum(np.r_[0, orb_num_all[:-1]]).astype(np.int64)
+    rotation_matrix = np.asarray(rotation_matrix, dtype=float)
+    if rotation_matrix.shape != (3, 3):
+        raise ValueError(f"rotation_matrix must have shape (3, 3), got {rotation_matrix.shape}")
+
+    if translation_cart is None:
+        translation_cart = np.zeros(3, dtype=float)
+    translation_cart = np.asarray(translation_cart, dtype=float)
+    if translation_cart.shape != (3,):
+        raise ValueError(f"translation_cart must have shape (3,), got {translation_cart.shape}")
+
+    orb_mapping = {
+        "s": get_any_rot_orb_twostep("s", rotation_matrix),
+        "p": get_any_rot_orb_twostep("p", rotation_matrix),
+        "d": get_any_rot_orb_twostep("d", rotation_matrix),
+        "f": get_any_rot_orb_twostep("f", rotation_matrix),
+    }
+
+    rows_parts: list[np.ndarray] = []
+    cols_parts: list[np.ndarray] = []
+    data_parts: list[np.ndarray] = []
+
+    for source_group in (0, 1):
+        source_atom_types = atom_type_list[atom_twist_group_list == source_group]
+        source_g_list = source_g_lists[source_group]
+        target_map = normalized_group_maps[source_group]
+        for gi, q_source in enumerate(source_g_list):
+            q_source = np.asarray(q_source, dtype=float)
+            q_target = rotation_matrix[:2, :2] @ q_source
+            translation_phase = np.exp(1.0j * np.dot(q_target, translation_cart[:2]))
+            group_row_shift = int(shift3[source_group] + gi * orb_group_num[source_group])
+
+            for source_atom_type in source_atom_types:
+                if int(source_atom_type) not in target_map:
+                    raise ValueError(
+                        f"group_target_maps[{source_group}] is missing source atom_type={int(source_atom_type)}."
+                    )
+                target_atom_type = int(target_map[int(source_atom_type)])
+                target_group = int(atom_twist_group_list[target_atom_type])
+
+                source_orbitals = _parse_orbitals_from_orb_name(str(atom_orb_name_list[source_atom_type]))
+                target_orbitals = _parse_orbitals_from_orb_name(str(atom_orb_name_list[target_atom_type]))
+                if source_orbitals != target_orbitals:
+                    raise ValueError(
+                        "Reference transformed projector requires matched orbital content across mapped atom types; "
+                        + f"source atom_type={source_atom_type} {source_orbitals} vs "
+                        + f"target atom_type={target_atom_type} {target_orbitals}."
+                    )
+
+                orb_block = direct_sum(*generate_direct_sum_params(source_orbitals, orb_mapping))
+                row_block = orb_block.conj().T
+                orb_num = int(atom_orb_num_list[source_atom_type])
+                if row_block.shape != (orb_num, orb_num):
+                    raise ValueError(
+                        f"Orbital rotation block has shape {row_block.shape}, expected {(orb_num, orb_num)}."
+                    )
+
+                row_base = int(group_row_shift + shift1[source_atom_type])
+                row_idx = row_base + np.arange(orb_num, dtype=np.int64)
+                target_atom_idx = np.nonzero(
+                    (twist_group_all == target_group) & (atom_type_all == target_atom_type)
+                )[0]
+                if target_atom_idx.size == 0:
+                    raise ValueError(
+                        f"No target atoms found for mapped atom_type={target_atom_type} in twist_group={target_group}."
+                    )
+
+                phase_atoms = translation_phase * np.exp(-1.0j * (pos_array[target_atom_idx] @ q_target))
+                col_base = col_offsets[target_atom_idx]
+                for atom_phase, atom_col_base in zip(phase_atoms, col_base):
+                    rows_parts.append(np.repeat(row_idx, orb_num))
+                    cols_parts.append(
+                        np.tile(atom_col_base + np.arange(orb_num, dtype=np.int64), orb_num)
+                    )
+                    data_parts.append((atom_phase * factor_list[source_atom_type] * row_block).reshape(-1))
+
+    dim_rows = int(np.dot(g_group_num, orb_group_num))
+    dim_cols = int(np.sum(atom_num_list * atom_orb_num_list))
+    projector = scipy.sparse.coo_matrix(
+        (
+            np.concatenate(data_parts).astype(np.complex128, copy=False),
+            (np.concatenate(rows_parts), np.concatenate(cols_parts)),
+        ),
+        shape=(dim_rows, dim_cols),
+        dtype=np.complex128,
+    ).tocsr()
+    projector.sort_indices()
+
+    if getattr(structure, "spin", False):
+        spin_rep = spin_reps(rotation_matrix).conj().T
+        projector = scipy.sparse.csr_matrix(np.kron(spin_rep, projector.toarray()))
+    return projector
+
+
+def build_projected_m_valley_transport(structure, source_params, target_params):
+    angle_deg = _m_valley_rotation_delta(source_params.valley, target_params.valley)
+    df_temp = structure.df.copy()
+    unique_groups = sorted(df_temp["twist_group"].unique().tolist())
+    group_orb_blocks, spin_rep = _build_group_orbital_rotation_blocks(df_temp, angle_deg, structure.spin)
+    blocks = []
+
+    for gid in unique_groups:
+        source_g = source_params.g_vec_list_K1 if (gid % 2 == 0) else source_params.g_vec_list_K2
+        target_g = target_params.g_vec_list_K1 if (gid % 2 == 0) else target_params.g_vec_list_K2
+        g_transport = _build_rotation_match_matrix(source_g, target_g, angle_deg)
+        blocks.append(np.kron(g_transport, group_orb_blocks[gid]))
+
+    transport = direct_sum(*blocks)
+    if structure.spin:
+        transport = np.kron(spin_rep, transport)
+    return scipy.sparse.csr_matrix(transport)
+
+
+def build_reference_m_valley_c2_transport(structure, reference_params):
+    if reference_params.valley not in _M_VALLEY_TRIPLET:
+        raise ValueError(f"Reference C2 transport only supports M valleys {_M_VALLEY_TRIPLET}.")
+    if "twist_group" not in structure.df.columns:
+        raise ValueError("structure.df must contain 'twist_group' column for reference M-valley C2 transport.")
+
+    unique_groups = sorted(structure.df["twist_group"].unique().tolist())
+    if unique_groups != [0, 1]:
+        raise ValueError(
+            f"Reference M-valley C2 transport currently supports bilayer twist_group=[0, 1], got {unique_groups}."
+        )
+
+    resolved_symmetry = None
+    can_resolve_from_structure = bool(
+        hasattr(structure, "Tmat")
+        and {"x", "y", "z", "species", "twist_group", "atom_type"}.issubset(structure.df.columns)
+    )
+    if can_resolve_from_structure:
+        resolved_symmetry = resolve_reference_m_valley_c2_symmetry(structure, reference_params)
+        reflection_2d = reference_m_valley_c2_linear_map(reference_params)
+        m_k1 = getattr(reference_params, "m_K1", None)
+        m_k2 = getattr(reference_params, "m_K2", None)
+        if m_k1 is None or m_k2 is None:
+            _, _, m_k1, m_k2, _ = reference_params.calculate_K_points()
+        axis_vec = np.asarray(m_k1, dtype=float) + np.asarray(m_k2, dtype=float)
+        axis_norm = float(np.linalg.norm(axis_vec))
+        if axis_norm < 1.0e-12:
+            raise ValueError("Cannot determine the reference C2 axis because m_K1 + m_K2 is numerically zero.")
+        axis_vec = axis_vec / axis_norm
+        # Keep the legacy projected-basis C2 axis for the orbital/spin rotation blocks.
+        # The resolved spglib operation is still used to derive the cross-layer atom-type mapping.
+        rotation_matrix = rotate_mat(np.array([axis_vec[0], axis_vec[1], 0.0]), np.pi)
+        translation_cart = np.asarray(resolved_symmetry.translation_cart, dtype=float)
+        if np.linalg.norm(translation_cart[:2]) > 1.0e-8:
+            raise ValueError(
+                "Reference M-valley C2 transport currently requires zero in-plane fractional translation; "
+                + f"got translation_cart[:2]={translation_cart[:2]!r}."
+            )
+        target_map_0_to_1 = resolved_symmetry.atom_type_map_0_to_1
+        target_map_1_to_0 = resolved_symmetry.atom_type_map_1_to_0
+    else:
+        # Legacy geometric fallback for synthetic/unit-test structures that do not
+        # carry the full Cartesian coordinates needed for spglib symmetry recovery.
+        m_k1 = getattr(reference_params, "m_K1", None)
+        m_k2 = getattr(reference_params, "m_K2", None)
+        if m_k1 is None or m_k2 is None:
+            _, _, m_k1, m_k2, _ = reference_params.calculate_K_points()
+        axis_vec = np.asarray(m_k1, dtype=float) + np.asarray(m_k2, dtype=float)
+        axis_norm = float(np.linalg.norm(axis_vec))
+        if axis_norm < 1.0e-12:
+            raise ValueError("Cannot determine the reference C2 axis because m_K1 + m_K2 is numerically zero.")
+        axis_vec = axis_vec / axis_norm
+        reflection_2d = reference_m_valley_c2_linear_map(reference_params)
+        rotation_matrix = rotate_mat(np.array([axis_vec[0], axis_vec[1], 0.0]), np.pi)
+        target_map_0_to_1 = None
+        target_map_1_to_0 = None
+
+    c2t_spin_rep = reference_m_valley_c2_spin_unitary(rotation_matrix) if structure.spin else None
+
+    group_transport_0_to_1, spin_rep = _build_group_orbital_transport_between_groups(
+        structure_df=structure.df.copy(),
+        source_group=0,
+        target_group=1,
+        rotation_matrix=rotation_matrix,
+        spin=structure.spin,
+        spin_rep=c2t_spin_rep,
+        target_for_source=target_map_0_to_1,
+    )
+    group_transport_1_to_0, _ = _build_group_orbital_transport_between_groups(
+        structure_df=structure.df.copy(),
+        source_group=1,
+        target_group=0,
+        rotation_matrix=rotation_matrix,
+        spin=structure.spin,
+        spin_rep=spin_rep,
+        target_for_source=target_map_1_to_0,
+    )
+
+    if group_transport_0_to_1.shape[1] != group_transport_1_to_0.shape[0] or group_transport_0_to_1.shape[0] != group_transport_1_to_0.shape[1]:
+        raise ValueError(
+            "Reference M-valley C2 transport requires matched orbital transport blocks across the two twist groups; "
+            + f"got {group_transport_0_to_1.shape} and {group_transport_1_to_0.shape}."
+        )
+
+    g_0_to_1 = _build_linear_match_matrix(
+        reference_params.g_vec_list_K1,
+        reference_params.g_vec_list_K2,
+        reflection_2d,
+    )
+    g_1_to_0 = _build_linear_match_matrix(
+        reference_params.g_vec_list_K2,
+        reference_params.g_vec_list_K1,
+        reflection_2d,
+    )
+
+    block_0_to_1 = np.kron(g_0_to_1, group_transport_0_to_1)
+    block_1_to_0 = np.kron(g_1_to_0, group_transport_1_to_0)
+    dim0 = block_0_to_1.shape[1]
+    dim1 = block_1_to_0.shape[1]
+    if block_1_to_0.shape[0] != dim0 or block_0_to_1.shape[0] != dim1:
+        raise ValueError(
+            "Reference M-valley C2 transport block dimensions are inconsistent with the projected basis: "
+            f"0->1 shape={block_0_to_1.shape}, 1->0 shape={block_1_to_0.shape}."
+        )
+
+    zero_00 = np.zeros((dim0, dim0), dtype=np.complex128)
+    zero_11 = np.zeros((dim1, dim1), dtype=np.complex128)
+    transport = np.block(
+        [
+            [zero_00, block_1_to_0],
+            [block_0_to_1, zero_11],
+        ]
+    )
+    if structure.spin:
+        transport = np.kron(spin_rep, transport)
+    return scipy.sparse.csr_matrix(transport)
+
+
+def reference_m_valley_c2_linear_map(reference_params) -> np.ndarray:
+    m_k1 = getattr(reference_params, "m_K1", None)
+    m_k2 = getattr(reference_params, "m_K2", None)
+    if m_k1 is None or m_k2 is None:
+        _, _, m_k1, m_k2, _ = reference_params.calculate_K_points()
+    axis_vec = np.asarray(m_k1, dtype=float) + np.asarray(m_k2, dtype=float)
+    axis_norm = float(np.linalg.norm(axis_vec))
+    if axis_norm < 1.0e-12:
+        raise ValueError("Cannot determine the reference C2 axis because m_K1 + m_K2 is numerically zero.")
+    axis_vec = axis_vec / axis_norm
+    return 2.0 * np.outer(axis_vec, axis_vec) - np.eye(2, dtype=float)
 
 
 def _write_progress_state(progress_dir: str | None, index: int, stage: str) -> None:
@@ -523,6 +1624,11 @@ class TAPW_parameters:
         self.n_g = self.config.n_g
         self.valley = self.config.valley
         self.structure = structure
+        self.bravais = getattr(self.config, "bravais", "hex")
+        self.c3_h_disable_reason = None
+        if self.config.C3_H:
+            self.c3_h_disable_reason = single_valley_c3_incompatibility_reason(self.bravais, self.valley)
+        self.use_C3_H = bool(self.config.C3_H and self.c3_h_disable_reason is None)
 
         # Initialize matrices
         self.g_matrix = None
@@ -1345,7 +2451,7 @@ class TAPW_parameters:
         # diff = np.sum(np.abs(test1 - test2))
         # print("diff = ", diff)
         # exit()
-        if self.config.C3_H:
+        if self.use_C3_H:
             self.generate_C3_matrix()
             self.generate_g_symm_matrix()
         print("g matrix shape = ", self.g_matrix.shape)
@@ -1379,6 +2485,17 @@ class BandStructureCalculator:
         
         self.result = {}
         self._progress_dir: str | None = None
+        self.use_C3_H = bool(self.config.C3_H)
+        self.use_M_valley_threefold_symm = uses_m_valley_threefold_symmetrization(self.config)
+        self.use_M_valley_d3_symm = uses_m_valley_d3_symmetrization(self.config)
+        self._m_valley_reference = 31
+        self._m_valley_parameters: dict[int, TAPW_parameters] = {}
+        self._m_valley_transport_ref_to_valley: dict[int, scipy.sparse.csr_matrix] = {}
+        self._m_valley_transport_valley_to_ref: dict[int, scipy.sparse.csr_matrix] = {}
+        self._m_valley_d3_reference_projectors: list[SimpleNamespace] = []
+        self._m_valley_c2_reference_symmetry: SimpleNamespace | None = None
+        self._m_valley_c2_reference_transport: scipy.sparse.csr_matrix | None = None
+        self._m_valley_c2_reference_linear_map: np.ndarray | None = None
         
         # Validate valley configuration
         if not hasattr(self.config, 'valley') or self.config.valley not in self.VALLEY_MAP:
@@ -1393,8 +2510,19 @@ class BandStructureCalculator:
         self._ef_onsite_orb: np.ndarray | None = None
         
         if self.config.TAPW:
-            self.TAPW_parameters = TAPW_parameters(self.structure, self.config)
-            self.TAPW_parameters.generate_all_parameters()
+            if self.use_M_valley_threefold_symm:
+                self.use_C3_H = False
+                self._initialize_m_valley_threefold_symmetrization()
+            else:
+                self.TAPW_parameters = TAPW_parameters(self.structure, self.config)
+                self.use_C3_H = self.TAPW_parameters.use_C3_H
+                if self.config.C3_H and not self.use_C3_H:
+                    print(
+                        "[C3_H] "
+                        + self.TAPW_parameters.c3_h_disable_reason
+                        + f" Proceeding with C3_H disabled for valley {self.config.valley}."
+                    )
+                self.TAPW_parameters.generate_all_parameters()
             
         if self.config.gpu and cp is None:
             raise ImportError("CuPy is not installed. Please install CuPy to use GPU acceleration.")
@@ -1426,6 +2554,118 @@ class BandStructureCalculator:
             self._ef_onsite_orb = ef_orb
         else:
             self._ef_onsite_orb = None
+
+    def _clone_compute_config_for_valley(self, valley: int) -> ComputeConfig:
+        cfg = copy.deepcopy(self.config)
+        cfg.valley = valley
+        cfg.valleys = [valley]
+        return cfg
+
+    def _initialize_m_valley_threefold_symmetrization(self) -> None:
+        print(
+            f"[M-C3] Enabling threefold M-valley symmetrization for requested valley {self.config.valley} "
+            f"with reference valley {self._m_valley_reference}."
+        )
+        for valley in _M_VALLEY_TRIPLET:
+            cfg = self._clone_compute_config_for_valley(valley)
+            params = TAPW_parameters(self.structure, cfg)
+            params.generate_all_parameters()
+            self._m_valley_parameters[valley] = params
+
+        self.TAPW_parameters = self._m_valley_parameters[self.config.valley]
+
+        identity = scipy.sparse.identity(
+            self._m_valley_parameters[self._m_valley_reference].g_matrix.shape[0],
+            dtype=np.complex128,
+            format="csr",
+        )
+        self._m_valley_transport_ref_to_valley[self._m_valley_reference] = identity
+        self._m_valley_transport_valley_to_ref[self._m_valley_reference] = identity
+
+        for valley in _M_VALLEY_TRIPLET:
+            if valley == self._m_valley_reference:
+                continue
+            transport = build_projected_m_valley_transport(
+                self.structure,
+                self._m_valley_parameters[self._m_valley_reference],
+                self._m_valley_parameters[valley],
+            )
+            self._m_valley_transport_ref_to_valley[valley] = transport
+            self._m_valley_transport_valley_to_ref[valley] = transport.conj().T.tocsr()
+
+        if self.use_M_valley_d3_symm:
+            print(
+                f"[M-D3] Enabling additional reference-valley C2 projection on M{self._m_valley_reference - 30}."
+            )
+            self._m_valley_c2_reference_symmetry = resolve_reference_m_valley_c2_symmetry(
+                self.structure,
+                self._m_valley_parameters[self._m_valley_reference],
+            )
+            self._m_valley_c2_reference_linear_map = None
+            self._m_valley_c2_reference_transport = None
+            self._m_valley_d3_reference_projectors = self._build_m_valley_d3_reference_projectors()
+
+    def _normalize_projector_matrix(self, projector):
+        if scipy.sparse.issparse(projector):
+            projector = projector.tocsr()
+            projector.sort_indices()
+            return projector
+        return np.asarray(projector, dtype=np.complex128)
+
+    def _build_m_valley_d3_reference_projectors(self) -> list[SimpleNamespace]:
+        if self._m_valley_c2_reference_symmetry is None:
+            raise ValueError("Reference M-valley C2 symmetry must be resolved before building D3 projectors.")
+
+        reference_params = self._m_valley_parameters[self._m_valley_reference]
+        resolved_symmetry = self._m_valley_c2_reference_symmetry
+        projectors: list[SimpleNamespace] = []
+
+        def _append_projector(label: str, linear_map_2d: np.ndarray, projector) -> None:
+            projectors.append(
+                SimpleNamespace(
+                    label=label,
+                    linear_map_2d=np.asarray(linear_map_2d, dtype=float),
+                    projector=self._normalize_projector_matrix(projector),
+                )
+            )
+
+        _append_projector("identity", np.eye(2, dtype=float), reference_params.g_matrix)
+
+        for valley in (32, 33):
+            angle_deg = _m_valley_rotation_delta(self._m_valley_reference, valley)
+            rotation = np.asarray(rot_matrix(angle_deg), dtype=float)
+            projector = self._m_valley_transport_valley_to_ref[valley] @ self._m_valley_parameters[valley].g_matrix
+            _append_projector(f"c3_valley_{valley}", rotation[:2, :2], projector)
+
+        c2_rotation = np.asarray(resolved_symmetry.rotation_cart, dtype=float)
+        c2_translation = np.asarray(resolved_symmetry.translation_cart, dtype=float)
+        group_target_maps = {
+            0: resolved_symmetry.atom_type_map_0_to_1,
+            1: resolved_symmetry.atom_type_map_1_to_0,
+        }
+
+        for label, angle_deg in (
+            ("c2", 0),
+            ("c3_c2", 120),
+            ("c3_sq_c2", 240),
+        ):
+            if angle_deg == 0:
+                rotation = c2_rotation
+                translation = c2_translation
+            else:
+                c3_rotation = np.asarray(rot_matrix(angle_deg), dtype=float)
+                rotation = c3_rotation @ c2_rotation
+                translation = c3_rotation @ c2_translation
+            projector = _build_reference_m_valley_transformed_projector(
+                structure=self.structure,
+                reference_params=reference_params,
+                rotation_matrix=rotation,
+                group_target_maps=group_target_maps,
+                translation_cart=translation,
+            )
+            _append_projector(label, rotation[:2, :2], projector)
+
+        return projectors
 
     def generate_kmesh(self, num_k1, num_k2=None):
         """Generate a uniform fractional kappa-grid for Chern calculations.
@@ -1594,7 +2834,7 @@ class BandStructureCalculator:
                    self.TAPW_parameters.g_vec_list_K1)
             np.save(os.path.join(path, f"g_vec_list_{self.config.n_g}_{self.valley_flag}_2layer"),
                    self.TAPW_parameters.g_vec_list_K2)
-        if self.config.C3_H:
+        if self.use_C3_H:
             np.save(os.path.join(path, f"C3_matrix_{self.valley_flag}"),
                    self.TAPW_parameters.C3_matrix.toarray())
         # Calculate bands
@@ -2045,10 +3285,11 @@ class BandStructureCalculator:
         #     return self.cal_TAPW_hamiltonian_k_gpu(hamk)
         return self.cal_TAPW_hamiltonian_k_cpu(hamk)
 
-    def cal_TAPW_hamiltonian_k_cpu(self, hamk):
+    def cal_TAPW_hamiltonian_k_cpu(self, hamk, tapw_parameters=None):
         """CPU version of TAPW Hamiltonian calculation"""
-        g = self.TAPW_parameters.g_matrix
-        gH = self.TAPW_parameters.g_matrix_conj
+        tapw_parameters = self.TAPW_parameters if tapw_parameters is None else tapw_parameters
+        g = tapw_parameters.g_matrix
+        gH = tapw_parameters.g_matrix_conj
 
         use_sparse_dot = bool(getattr(self.config, "use_sparse_dot_mkl", False))
         if use_sparse_dot and _HAS_SPARSE_DOT_MKL and scipy.sparse.issparse(g) and scipy.sparse.issparse(hamk) and scipy.sparse.issparse(gH):
@@ -2059,6 +3300,143 @@ class BandStructureCalculator:
 
         result = g @ hamk @ gH
         return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
+
+    def _get_raw_tapw_projected_hs_for_parameters(self, Hr, Sr, k, mpi_index, tapw_parameters):
+        h_full = self.Getk_super_gauge_sparse(Hr, k, type="H")
+        hamk = self.cal_TAPW_hamiltonian_k_cpu(h_full, tapw_parameters=tapw_parameters)
+
+        orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
+        if orthogonal_basis:
+            return hamk, None
+
+        s_full = self.Getk_super_gauge_sparse(Sr, k, type="S")
+        samk = self.cal_TAPW_hamiltonian_k_cpu(s_full, tapw_parameters=tapw_parameters)
+        return hamk, samk
+
+    def _project_full_space_matrix_with_projector(self, full_matrix, projector):
+        if scipy.sparse.issparse(projector):
+            projector = projector.tocsr()
+            projector_h = projector.conj().T.tocsr()
+            result = projector @ full_matrix @ projector_h
+            return result.toarray() if scipy.sparse.issparse(result) else np.asarray(result)
+
+        projector = np.asarray(projector, dtype=np.complex128)
+        full_matrix = full_matrix.toarray() if scipy.sparse.issparse(full_matrix) else np.asarray(full_matrix)
+        return np.asarray(projector @ full_matrix @ projector.conj().T)
+
+    def _get_raw_projected_hs_with_projector(self, Hr, Sr, k, mpi_index, projector):
+        h_full = self.Getk_super_gauge_sparse(Hr, k, type="H")
+        hamk = self._project_full_space_matrix_with_projector(h_full, projector)
+
+        orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
+        if orthogonal_basis:
+            return hamk, None
+
+        s_full = self.Getk_super_gauge_sparse(Sr, k, type="S")
+        samk = self._project_full_space_matrix_with_projector(s_full, projector)
+        return hamk, samk
+
+    def _finalize_tapw_projected_hs(self, hamk, samk, mpi_index):
+        if self.config.orthogonal_basis:
+            return hamk, None
+
+        if samk is None:
+            raise ValueError("Non-orthogonal TAPW finalization requires an overlap matrix.")
+
+        if not self.config.ge:
+            return self.gen_H_new(hamk, samk, mpi_index), None
+        return hamk, samk
+
+    def _get_tapw_projected_hs_for_parameters(self, Hr, Sr, k, mpi_index, tapw_parameters):
+        hamk, samk = self._get_raw_tapw_projected_hs_for_parameters(
+            Hr, Sr, k, mpi_index, tapw_parameters
+        )
+        return self._finalize_tapw_projected_hs(hamk, samk, mpi_index)
+
+    def _calculate_reference_m_valley_c3_hs(self, k_reference, mpi_index):
+        raw_hs = {}
+        for valley in _M_VALLEY_TRIPLET:
+            local_k = rotate_local_k_between_m_valleys(
+                k_reference,
+                self.structure.reciprocal_Tmat,
+                source_valley=self._m_valley_reference,
+                target_valley=valley,
+            )
+            raw_hs[valley] = self._get_raw_tapw_projected_hs_for_parameters(
+                self.hr_supercell,
+                self.sr_supercell,
+                local_k,
+                mpi_index,
+                self._m_valley_parameters[valley],
+            )
+
+        return threefold_reference_hs_average(
+            raw_hs[31][0],
+            raw_hs[31][1],
+            raw_hs[32][0],
+            raw_hs[32][1],
+            raw_hs[33][0],
+            raw_hs[33][1],
+            self._m_valley_transport_valley_to_ref[32],
+            self._m_valley_transport_valley_to_ref[33],
+        )
+
+    def _calculate_reference_m_valley_d3_hs(self, k_reference, mpi_index):
+        if not self._m_valley_d3_reference_projectors:
+            raise ValueError("Reference M-valley D3 projectors are not initialized.")
+
+        orthogonal_basis = bool(getattr(getattr(self, "config", None), "orthogonal_basis", False))
+        h_sum = None
+        s_sum = None
+
+        for projector_term in self._m_valley_d3_reference_projectors:
+            k_transformed = transform_k_by_cartesian_linear_map(
+                k_reference,
+                self.structure.reciprocal_Tmat,
+                projector_term.linear_map_2d,
+            )
+            hamk, samk = self._get_raw_projected_hs_with_projector(
+                self.hr_supercell,
+                self.sr_supercell,
+                k_transformed,
+                mpi_index,
+                projector_term.projector,
+            )
+            h_sum = np.array(hamk, copy=True) if h_sum is None else (h_sum + hamk)
+            if orthogonal_basis:
+                continue
+            if samk is None:
+                raise ValueError("Reference M-valley D3 averaging requires overlap matrices in non-orthogonal mode.")
+            s_sum = np.array(samk, copy=True) if s_sum is None else (s_sum + samk)
+
+        count = float(len(self._m_valley_d3_reference_projectors))
+        h_avg = h_sum / count
+        if orthogonal_basis:
+            return h_avg, None
+        if s_sum is None:
+            raise ValueError("Reference M-valley D3 averaging did not accumulate any overlap matrices.")
+        return h_avg, s_sum / count
+
+    def _calculate_m_valley_threefold_hs(self, k, mpi_index):
+        k_reference = rotate_local_k_between_m_valleys(
+            k,
+            self.structure.reciprocal_Tmat,
+            source_valley=self.config.valley,
+            target_valley=self._m_valley_reference,
+        )
+
+        if getattr(self, "use_M_valley_d3_symm", False):
+            h_ref_sym, s_ref_sym = self._calculate_reference_m_valley_d3_hs(k_reference, mpi_index)
+        else:
+            h_ref_sym, s_ref_sym = self._calculate_reference_m_valley_c3_hs(k_reference, mpi_index)
+
+        if self.config.valley == self._m_valley_reference:
+            return self._finalize_tapw_projected_hs(h_ref_sym, s_ref_sym, mpi_index)
+
+        transport = self._m_valley_transport_ref_to_valley[self.config.valley]
+        hamk = transport_matrix_between_m_valleys(h_ref_sym, transport)
+        samk = None if s_ref_sym is None else transport_matrix_between_m_valleys(s_ref_sym, transport)
+        return self._finalize_tapw_projected_hs(hamk, samk, mpi_index)
     
     @timing_decorator_factory(process_id=0)
     def Getk_super_gauge_sparse_symm_final_HS(self, Hr, Sr, symm_matrix, symm_matrix_inv, k, mpi_index):
@@ -2087,7 +3465,12 @@ class BandStructureCalculator:
         """Calculate band structure for a single k-point"""
         if self.config.TAPW:
             self._set_progress_stage(i, "build_hs")
-            if self.config.C3_H:
+            if self.use_M_valley_threefold_symm:
+                hamk, samk = self._calculate_m_valley_threefold_hs(
+                    kpoints[:3],
+                    self.config.gpu_index[i % self.config.gpu_num],
+                )
+            elif self.use_C3_H:
                 hamk, samk = self.Getk_super_gauge_sparse_symm_final_HS(
                     self.hr_supercell, self.sr_supercell, 
                     self.TAPW_parameters.symm_matrix, self.TAPW_parameters.symm_matrix_inv, 
