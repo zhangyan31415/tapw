@@ -2631,14 +2631,91 @@ class BandStructureCalculator:
             if cols_template_parts
             else np.empty(0, dtype=np.int64)
         )
+        sort_order = (
+            np.lexsort((cols_template, rows_template)).astype(np.int64, copy=False)
+            if offset
+            else np.empty(0, dtype=np.int64)
+        )
+        rows_sorted = rows_template[sort_order] if offset else rows_template
+        cols_sorted = cols_template[sort_order] if offset else cols_template
+        if offset:
+            unique_mask = np.empty(int(offset), dtype=bool)
+            unique_mask[0] = True
+            unique_mask[1:] = (
+                (rows_sorted[1:] != rows_sorted[:-1])
+                | (cols_sorted[1:] != cols_sorted[:-1])
+            )
+            compressed_positions_sorted = np.cumsum(unique_mask, dtype=np.int64) - 1
+            compressed_positions = np.empty(int(offset), dtype=np.int64)
+            compressed_positions[sort_order] = compressed_positions_sorted
+            csr_unique_rows = rows_sorted[unique_mask]
+            csr_indices = cols_sorted[unique_mask]
+            csr_nnz = int(csr_indices.shape[0])
+            has_duplicates = bool(csr_nnz != int(offset))
+        else:
+            unique_mask = np.empty(0, dtype=bool)
+            compressed_positions = np.empty(0, dtype=np.int64)
+            csr_unique_rows = np.empty(0, dtype=np.int64)
+            csr_indices = np.empty(0, dtype=np.int64)
+            csr_nnz = 0
+            has_duplicates = False
         cached = SimpleNamespace(
             nnz_total=int(offset),
             rows_template=rows_template,
             cols_template=cols_template,
             blocks=blocks,
+            sort_order=sort_order,
+            compressed_positions=compressed_positions,
+            csr_unique_rows=csr_unique_rows,
+            csr_indices=csr_indices,
+            csr_nnz=csr_nnz,
+            has_duplicates=has_duplicates,
+            csr_num_wann=None,
+            csr_indptr=None,
         )
         self._realspace_block_cache[cache_key] = cached
         return cached
+
+    def _compress_raw_realspace_data_to_csr(self, block_cache, raw_data, num_wann: int):
+        raw_data = np.asarray(raw_data, dtype=np.complex128)
+        if raw_data.shape[0] != block_cache.nnz_total:
+            raise ValueError(
+                f"raw_data length {raw_data.shape[0]} does not match cached nnz_total {block_cache.nnz_total}"
+            )
+
+        if block_cache.csr_num_wann != int(num_wann) or block_cache.csr_indptr is None:
+            counts = np.bincount(
+                block_cache.csr_unique_rows,
+                minlength=int(num_wann),
+            )
+            indptr = np.empty(int(num_wann) + 1, dtype=np.int64)
+            indptr[0] = 0
+            np.cumsum(counts, out=indptr[1:])
+            block_cache.csr_indptr = indptr
+            block_cache.csr_num_wann = int(num_wann)
+
+        if block_cache.has_duplicates:
+            data = (
+                np.bincount(
+                    block_cache.compressed_positions,
+                    weights=raw_data.real,
+                    minlength=block_cache.csr_nnz,
+                )
+                + 1j
+                * np.bincount(
+                    block_cache.compressed_positions,
+                    weights=raw_data.imag,
+                    minlength=block_cache.csr_nnz,
+                )
+            )
+        else:
+            data = raw_data[block_cache.sort_order]
+
+        return scipy.sparse.csr_matrix(
+            (data, block_cache.csr_indices, block_cache.csr_indptr),
+            shape=(int(num_wann), int(num_wann)),
+            dtype=np.complex128,
+        )
 
     def _build_getk_phase_context(self, k) -> SimpleNamespace:
         kvec = self.get_kvec(k)
@@ -2674,12 +2751,7 @@ class BandStructureCalculator:
                 exp_kR = np.exp(1j * np.dot(kvec, block.rvec_cart))
                 dot_mn = phase_wann[block.row_index] - phase_wann[block.col_index]
                 data[block.data_slice] = block.values * np.exp(-1j * dot_mn) * exp_kR
-            mk = scipy.sparse.coo_matrix(
-                (data, (block_cache.rows_template, block_cache.cols_template)),
-                shape=(num_wann, num_wann),
-                dtype=np.complex128,
-            ).tocsr()
-            mk.sum_duplicates()
+            mk = self._compress_raw_realspace_data_to_csr(block_cache, data, num_wann)
         else:
             mk = scipy.sparse.csr_matrix((num_wann, num_wann), dtype=np.complex128)
             for rvec, values_dic in hr_blocks.items():
