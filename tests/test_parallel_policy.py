@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import tapw.cal_ham_01 as cal_ham_01
+from tapw.config import ComputeConfig
 
 
 def _make_cfg(**overrides):
@@ -60,3 +61,9 @@ def test_resolve_kpoint_parallel_policy_requires_multiple_processes_and_posix():
     assert one_proc.auto_promoted is False
     assert non_posix.parallel_impl == "joblib"
     assert non_posix.auto_promoted is False
+
+
+def test_compute_config_disables_tapw_auto_fork_by_default():
+    cfg = ComputeConfig()
+
+    assert cfg.tapw_auto_fork is False
