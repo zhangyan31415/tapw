@@ -97,6 +97,37 @@ def uses_m_valley_d3_symmetrization(config: ComputeConfig) -> bool:
     )
 
 
+def resolve_kpoint_parallel_policy(config: ComputeConfig, os_name: str | None = None) -> SimpleNamespace:
+    """Resolve the k-point parallel policy without touching non-TAPW solver constraints.
+
+    The repository defaults are `joblib/loky` because the non-TAPW SLEPc path needs
+    that spawn-based configuration. TAPW band calculations do not share that
+    restriction, and they already have a dedicated `mp`/fork implementation that
+    avoids repeatedly pickling a very large calculator object.
+    """
+    parallel_impl = str(getattr(config, "parallel_impl", "joblib"))
+    parallel_backend = str(getattr(config, "parallel_backend", "loky"))
+    num_processes = int(getattr(config, "num_processes", 1))
+    auto_promoted = False
+
+    if (
+        getattr(config, "TAPW", False)
+        and bool(getattr(config, "tapw_auto_fork", True))
+        and num_processes > 1
+        and parallel_impl == "joblib"
+        and parallel_backend == "loky"
+        and (os_name or os.name) == "posix"
+    ):
+        parallel_impl = "mp"
+        auto_promoted = True
+
+    return SimpleNamespace(
+        parallel_impl=parallel_impl,
+        parallel_backend=parallel_backend,
+        auto_promoted=auto_promoted,
+    )
+
+
 def rotate_local_k_between_m_valleys(k_local, reciprocal_tmat, source_valley: int, target_valley: int):
     if source_valley not in _M_VALLEY_ROTATIONS or target_valley not in _M_VALLEY_ROTATIONS:
         raise ValueError(f"M-valley rotation only supports {_M_VALLEY_TRIPLET}, got {source_valley}->{target_valley}")
@@ -1336,9 +1367,10 @@ def _maybe_pin_current_worker(slot_width: int | None, worker_count: int | None) 
         return
 
 
-def _mp_worker_init(blas_threads: int) -> None:
+def _mp_worker_init(blas_threads: int, worker_count: int | None = None) -> None:
     # Called once per multiprocessing worker process.
     _set_thread_limits(blas_threads)
+    _maybe_pin_current_worker(blas_threads, worker_count)
 
 
 def _solve_eigs_slepc(hamk, samk, cfg: ComputeConfig) -> np.ndarray:
@@ -3778,9 +3810,16 @@ class BandStructureCalculator:
 
         num_processes = int(getattr(self.config, "num_processes", 1))
         blas_threads = int(getattr(self.config, "blas_threads", 1))
-        parallel_impl = getattr(self.config, "parallel_impl", "joblib")
-        parallel_backend = getattr(self.config, "parallel_backend", "loky")
+        parallel_policy = resolve_kpoint_parallel_policy(self.config)
+        parallel_impl = parallel_policy.parallel_impl
+        parallel_backend = parallel_policy.parallel_backend
         vec_store = getattr(self.config, "vec_store", "memory")
+
+        if parallel_policy.auto_promoted:
+            print(
+                "[parallel] auto-switching TAPW k-point loop from joblib/loky "
+                "to mp/fork to avoid large-calculator pickling overhead."
+            )
 
         print(
             "Parallel config: "
@@ -3868,7 +3907,7 @@ class BandStructureCalculator:
                     with ctx.Pool(
                         processes=num_processes,
                         initializer=_mp_worker_init,
-                        initargs=(blas_threads,),
+                        initargs=(blas_threads, num_processes),
                     ) as pool:
                         statuses = list(
                             tqdm(

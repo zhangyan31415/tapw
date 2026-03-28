@@ -147,6 +147,7 @@ class ComputeConfig:
     blas_threads: int = 1  # BLAS/OpenMP threads per worker (prevents oversubscription)
     parallel_impl: str = "joblib"  # "joblib" or "mp"
     parallel_backend: str = "loky"  # joblib backend: "loky" (spawn) or "multiprocessing" (fork on Linux)
+    tapw_auto_fork: bool = True  # For TAPW on POSIX, auto-upgrade the default joblib/loky k-loop to mp/fork.
     vec_store: str = "memory"  # "memory" or "memmap" (recommended for large k-mesh + wavefunctions)
     memmap_dir: Optional[str] = None  # If set, store memmap outputs here; otherwise use output path
     kpoint_chunk_id: int = 0  # For job-array sharding: 0-based chunk index
@@ -176,6 +177,7 @@ class ComputeConfig:
     TAPW: bool = True
     eigsh_cal: bool = True
     C3_H: bool = False
+    M_valley_D3_H: bool = False  # For hex TAPW M valleys, add the single-M C2 projection after the C3 orbit average.
     ge: bool = False
     eig_vec_cal: bool = True
     valley: int = field(init=False)  # Current valley being calculated
