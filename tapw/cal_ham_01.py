@@ -2966,16 +2966,23 @@ class BandStructureCalculator:
     def generate_kmesh(self, num_k1, num_k2=None):
         """Generate a uniform fractional kappa-grid for Chern calculations.
 
-        The returned points follow NumPy row-major flatten order with
-        `indexing='ij'`, so reshaping downstream as `(num_k1, num_k2, ...)`
-        preserves the stored order.
+        Backward compatibility:
+        - Historical square-grid Chern runs in the original `tapw` code used
+          `np.meshgrid(kx, ky)` with the default `xy` convention before the
+          final row-major flatten. Existing `vec_*_2d_<N>.npy` files and WCC
+          post-processing therefore expect that square-grid flat order.
+        - Rectangular grids are a `tapw_mkl` extension and keep the explicit
+          `indexing='ij'` convention introduced for that feature.
         """
         if num_k2 is None:
             num_k2 = num_k1
 
         kappa1 = np.linspace(-0.5, 0.5, int(num_k1), endpoint=True)
         kappa2 = np.linspace(-0.5, 0.5, int(num_k2), endpoint=True)
-        kappa1_mesh, kappa2_mesh = np.meshgrid(kappa1, kappa2, indexing='ij')
+        if int(num_k1) == int(num_k2):
+            kappa1_mesh, kappa2_mesh = np.meshgrid(kappa1, kappa2)
+        else:
+            kappa1_mesh, kappa2_mesh = np.meshgrid(kappa1, kappa2, indexing='ij')
         kpoints = np.stack(
             (
                 kappa1_mesh,
@@ -3464,38 +3471,12 @@ class BandStructureCalculator:
     @timing_decorator_factory(process_id=0)
     def gen_H_new_cpu(self, hamk, samk):
         """CPU version of Hamiltonian transformation"""
-        # Reduce generalized Hermitian EVP to standard form.
-        #
-        # Prefer Cholesky (S = L L^H): much faster and lower-memory than the
-        # symmetric-orthogonalization route (eigh(S) -> S^{-1/2}).
-        #
-        # If S is not positive definite (numerical issues), fall back to the
-        # original robust (but expensive) method.
-        try:
-            L = scipy.linalg.cholesky(samk, lower=True, check_finite=False)
-            # A = L^{-1} H L^{-H}
-            X = scipy.linalg.solve_triangular(L, hamk, lower=True, trans='N', check_finite=False)
-            # For complex matrices the right factor must be L^{-H}, not a plain transpose-based solve.
-            hamk_new = scipy.linalg.solve_triangular(
-                L,
-                X.conj().T,
-                lower=True,
-                trans='N',
-                check_finite=False,
-            ).conj().T
-            # Numerical symmetrization (should be Hermitian).
-            hamk_new = (hamk_new + hamk_new.conj().T) / 2
-            return hamk_new
-        except Exception:
-            S_eig, S_vec = scipy.linalg.eigh(samk, check_finite=False)
-            # Guard against tiny/negative eigenvalues due to numerical noise.
-            eps = np.finfo(S_eig.dtype).eps
-            S_eig = np.clip(S_eig, eps, None)
-            M_inv = np.diag(1 / np.sqrt(S_eig))
-            UMinvUd = S_vec @ M_inv @ S_vec.conj().T
-            hamk_new = UMinvUd @ hamk @ UMinvUd
-            hamk_new = (hamk_new + hamk_new.conj().T) / 2
-            return hamk_new
+        # Use the legacy symmetric-orthogonalization path so TAPW eigenvectors
+        # remain consistent with historical `tapw` outputs.
+        s_eig, s_vec = scipy.linalg.eigh(samk, check_finite=False)
+        s_inv_sqrt = np.diag(1.0 / np.sqrt(s_eig))
+        uminvud = s_vec @ s_inv_sqrt @ s_vec.conj().T
+        return uminvud @ hamk @ uminvud
     
     @timing_decorator_factory(process_id=0)
     def gen_H_new_gpu(self, hamk, samk, gpu_index=0):

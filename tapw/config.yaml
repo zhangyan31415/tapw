@@ -47,10 +47,10 @@ compute:
   n_g: 3                  # Harmonic of G vectors
   
   # Band structure calculation parameters
-  num_processes: 21       # Number of k-point worker processes
-  blas_threads: 1         # BLAS/OpenMP threads per worker; increase carefully to avoid oversubscription
-  num_bands_cal: 200      # Number of bands to calculate
-  num_chern: 40          # Number of k-points for Chern number calculation (grid size will be num_chern x num_chern)
+  num_processes: 7       # Number of k-point worker processes
+  blas_threads: 4         # BLAS/OpenMP threads per worker; increase carefully to avoid oversubscription
+  num_bands_cal: 100      # Number of bands to calculate
+  num_chern: [31, 31]    # Chern/Wilson-loop grid in fractional coordinates; supports either a scalar (square grid) or [num_k1, num_k2]
   
   # Hardware acceleration
   gpu: false             # Whether to use GPU acceleration
@@ -63,8 +63,8 @@ compute:
   eigsh_cal: true       # Use eigsh for eigenvalue calculation
   C3_H: false           # Apply C3 symmetry to Hamiltonian
   ge: false             # Use generalized eigenvalue solver
-  eigensolver: "scipy"  # "scipy" or "slepc"; SLEPc currently requires joblib+loky and eig_vec_cal=false
-  eig_vec_cal: true     # Calculate eigenvectors 
+  eigensolver: "slepc"  # "scipy" or "slepc"; SLEPc currently requires joblib+loky and eig_vec_cal=false
+  eig_vec_cal: false     # Calculate eigenvectors 
 
   # Electric field parameters
   Electric_field_in_eVpA: 0.00  # Electric field strength in eV/Å
