@@ -2888,7 +2888,7 @@ class StructureProcessorSpglib:
         twist_index=None,
         Tmat=None,
         reciprocal_Tmat=None,
-        symprec: float = 5e-1,
+        symprec: float = 10e-1,
         spglib_z_lattice: float = 50.0,
     ):
         self.input_data = input_data

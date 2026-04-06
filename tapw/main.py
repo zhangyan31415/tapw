@@ -86,6 +86,17 @@ def can_reuse_m_valley_c3_band_outputs(compute_cfg) -> bool:
     return False
 
 
+def resolve_qshell_dir_name(compute_cfg, calculator) -> str:
+    qshell_name = f"Q_shell_{compute_cfg.n_g}"
+    uses_symm = bool(
+        getattr(calculator, "use_M_valley_threefold_symm", False)
+        or getattr(calculator, "use_C3_H", False)
+    )
+    if uses_symm:
+        return qshell_name + "_symm"
+    return qshell_name
+
+
 def copy_reused_m_valley_band_outputs(qshell_path: Path, source_valley_flag: str, target_valley_flag: str) -> None:
     band_dir = Path(qshell_path) / "band"
     band_dir.mkdir(exist_ok=True)
@@ -312,7 +323,7 @@ def main():
                     if getattr(calculator, "use_M_valley_threefold_symm", False):
                         reusable_m_valley_calculator = calculator
             
-            out_path = Path(config.paths.output_dir) / f"Q_shell_{config.compute.n_g}"
+            out_path = Path(config.paths.output_dir) / resolve_qshell_dir_name(config.compute, calculator)
             out_path.mkdir(exist_ok=True)
             
             if config.compute.mode == "slab":
