@@ -317,9 +317,19 @@ def transform_qgt_to_cartesian(qgt_fields, b_phys_2d):
     return qgt_cart
 
 
+def moire_bz_area(b_phys_2d):
+    """Return the moire Brillouin-zone area in Cartesian reciprocal units."""
+    return abs(float(np.linalg.det(b_phys_2d)))
+
+
+def scale_cartesian_geometric_field(field_cart, b_phys_2d):
+    """Scale an Angstrom^2 Cartesian geometric field into a dimensionless mBZ-normalized field."""
+    return np.asarray(field_cart, dtype=float) * (moire_bz_area(b_phys_2d) / (2.0 * np.pi))
+
+
 def integrate_cartesian_field_over_bz(scalar_field_cart, b_phys_2d, delta_kappa1, delta_kappa2):
     """Approximate a Cartesian scalar-field BZ integral from a uniform fractional-grid sum."""
-    area_element = abs(float(np.linalg.det(b_phys_2d))) * float(delta_kappa1) * float(delta_kappa2)
+    area_element = moire_bz_area(b_phys_2d) * float(delta_kappa1) * float(delta_kappa2)
     return float(np.sum(np.asarray(scalar_field_cart, dtype=float)) * area_element)
 
 
@@ -333,8 +343,8 @@ def trace_g_plot_title(title_prefix, trace_g_cart, b_phys_2d, delta_kappa1, delt
     trace_g_integral = integrate_cartesian_field_over_bz(trace_g_cart, b_phys_2d, delta_kappa1, delta_kappa2)
     return (
         title_prefix
-        + " Trace[g]\n"
-        + rf"$\int_{{\mathrm{{BZ}}}}\mathrm{{Tr}}\,g\,d^2k \approx {trace_g_integral:.4f}$"
+        + "\n"
+        + rf"$\frac{{1}}{{2\pi}}\int_{{\mathrm{{BZ}}}}\mathrm{{Tr}}\,g\,d^2k \approx {trace_g_integral / (2.0 * np.pi):.4f}$"
     )
 
 
@@ -349,7 +359,7 @@ def berry_curvature_density_plot_title(title_prefix, omega_xy_cart, b_phys_2d, d
     return (
         title_prefix
         + "\n"
-        + rf"$\int_{{\mathrm{{BZ}}}}\Omega_{{xy}}\,d^2k \approx {omega_integral:.4f},\ C \approx {chern_number:.4f}$"
+        + rf"$C \approx {chern_number:.4f}$"
     )
 
 
@@ -368,8 +378,11 @@ def field_colorbar_label(field_kind):
     labels = {
         "berry_flux": r"$\Phi_{\mathrm{Berry}}\ \mathrm{[rad]}$",
         "berry_curvature_density_cart": r"$\Omega_{xy}\ (\mathrm{\AA}^2)$",
+        "berry_curvature_density_scaled": r"$(A_{\mathrm{mBZ}}/2\pi)\,\Omega_{xy}$",
         "trace_g_cart": r"$\mathrm{Tr}\, g\ (\mathrm{\AA}^2)$",
+        "trace_g_scaled": r"$(A_{\mathrm{mBZ}}/2\pi)\,\mathrm{Tr}\, g$",
         "omega_xy_cart": r"$\Omega_{xy}\ (\mathrm{\AA}^2)$",
+        "omega_xy_scaled": r"$(A_{\mathrm{mBZ}}/2\pi)\,\Omega_{xy}$",
     }
     if field_kind not in labels:
         raise ValueError("Unknown field_kind={0}".format(field_kind))
@@ -401,7 +414,7 @@ def _configure_filled_contour_rendering(ax, contour):
     ax.set_rasterization_zorder(-4)
 
 
-def plot_scalar_field(plot_mesh, scalar_field, output_path, title, colorbar_label, data_columns, header):
+def plot_scalar_field(plot_mesh, scalar_field, output_path, title, colorbar_label, data_columns=None, header=None, save_table=True):
     values = np.asarray(scalar_field)
     if values.ndim != 2:
         raise ValueError("plot_scalar_field expects a 2D scalar field.")
@@ -432,7 +445,10 @@ def plot_scalar_field(plot_mesh, scalar_field, output_path, title, colorbar_labe
     fig.savefig(output_path, **default_savefig_kwargs())
     plt.close(fig)
 
-    _save_table(output_path, data_columns, header)
+    if save_table:
+        if data_columns is None or header is None:
+            raise ValueError("data_columns and header are required when save_table=True.")
+        _save_table(output_path, data_columns, header)
 
 
 def save_qgt_outputs(
@@ -446,8 +462,14 @@ def save_qgt_outputs(
     delta_kappa1,
     delta_kappa2,
 ):
+    qgt_fields = dict(qgt_fields)
+    # `kx_cart`, `ky_cart` use the physical reciprocal basis and therefore carry 1/Angstrom units.
     frac_points = flatten_coordinate_mesh(fractional_mesh)
     cart_points = flatten_coordinate_mesh(cartesian_mesh)
+    # `*_cart` fields retain the physical Angstrom^2 normalization. `*_scaled`
+    # fields are dimensionless and better suited for cross-twist-angle comparison.
+    qgt_fields["trace_g_scaled"] = scale_cartesian_geometric_field(qgt_fields["trace_g_cart"], b_phys_2d)
+    qgt_fields["omega_xy_scaled"] = scale_cartesian_geometric_field(qgt_fields["omega_xy_cart"], b_phys_2d)
 
     table = np.column_stack(
         [
@@ -463,7 +485,9 @@ def save_qgt_outputs(
             qgt_fields["gxy_cart"].reshape(-1),
             qgt_fields["gyy_cart"].reshape(-1),
             qgt_fields["trace_g_cart"].reshape(-1),
+            qgt_fields["trace_g_scaled"].reshape(-1),
             qgt_fields["omega_xy_cart"].reshape(-1),
+            qgt_fields["omega_xy_scaled"].reshape(-1),
         ]
     )
     txt_path = output_prefix + ".txt"
@@ -473,46 +497,19 @@ def save_qgt_outputs(
         header=(
             "kappa1 kappa2 kx_cart ky_cart "
             "g11_frac g12_frac g22_frac omega12_frac "
-            "gxx_cart gxy_cart gyy_cart trace_g_cart omega_xy_cart"
+            "gxx_cart gxy_cart gyy_cart trace_g_cart trace_g_scaled "
+            "omega_xy_cart omega_xy_scaled"
         ),
         fmt="%15.8f",
     )
-    np.savez(output_prefix + ".npz", **qgt_fields)
-    print("Saved QGT data to {0} and {1}".format(txt_path, output_prefix + ".npz"))
-
+    print("Saved QGT data to {0}".format(txt_path))
     plot_scalar_field(
         plot_mesh,
-        qgt_fields["trace_g_cart"],
-        output_prefix + "_trace_g_cart.pdf",
+        qgt_fields["trace_g_scaled"],
+        output_prefix + "_trace_g_scaled.pdf",
         trace_g_plot_title(title_prefix, qgt_fields["trace_g_cart"], b_phys_2d, delta_kappa1, delta_kappa2),
-        field_colorbar_label("trace_g_cart"),
-        np.column_stack(
-            [
-                frac_points[:, 0],
-                frac_points[:, 1],
-                cart_points[:, 0],
-                cart_points[:, 1],
-                qgt_fields["trace_g_cart"].reshape(-1),
-            ]
-        ),
-        "kappa1 kappa2 kx_cart ky_cart trace_g_cart",
-    )
-    plot_scalar_field(
-        plot_mesh,
-        qgt_fields["omega_xy_cart"],
-        output_prefix + "_omega_xy_cart.pdf",
-        title_prefix + r" $\Omega_{xy}$",
-        field_colorbar_label("omega_xy_cart"),
-        np.column_stack(
-            [
-                frac_points[:, 0],
-                frac_points[:, 1],
-                cart_points[:, 0],
-                cart_points[:, 1],
-                qgt_fields["omega_xy_cart"].reshape(-1),
-            ]
-        ),
-        "kappa1 kappa2 kx_cart ky_cart omega_xy_cart",
+        field_colorbar_label("trace_g_scaled"),
+        save_table=False,
     )
 
 
@@ -750,7 +747,9 @@ def main():
         sys.exit(1)
 
     delta_kappa1, delta_kappa2, kappa1_values, kappa2_values = compute_fractional_spacings(num_k1, num_k2)
+    # `kappa1`, `kappa2` are dimensionless fractional moire reciprocal coordinates.
     plaquette_fractional_mesh = build_fractional_plaquette_center_mesh(num_k1, num_k2)
+    # `kx_cart`, `ky_cart` come from the physical reciprocal basis and are in 1/Angstrom.
     plaquette_cart_mesh = fractional_mesh_to_cartesian(plaquette_fractional_mesh, b_phys_2d)
     plaquette_plot_mesh = fractional_mesh_to_cartesian(plaquette_fractional_mesh, b_plot)
     interior_fractional_mesh = build_fractional_interior_mesh(num_k1, num_k2)
@@ -773,56 +772,52 @@ def main():
                 delta_kappa1,
                 delta_kappa2,
             )
+            berry_curvature_density_scaled = scale_cartesian_geometric_field(
+                berry_curvature_density_cart,
+                b_phys_2d,
+            )
             chern_number = np.sum(berry_flux) / (2.0 * np.pi)
 
             frac_points = flatten_coordinate_mesh(plaquette_fractional_mesh)
             cart_points = flatten_coordinate_mesh(plaquette_cart_mesh)
 
-            berry_flux_path = os.path.join(output_dir, "berry_flux_band_{0}_{1}.pdf".format(raw_band_index, fig_suffix))
-            plot_scalar_field(
-                plaquette_plot_mesh,
-                berry_flux,
-                berry_flux_path,
-                "Berry Flux for Band {0} in {1} C={2:.4f}".format(raw_band_index, valley_str, chern_number),
-                field_colorbar_label("berry_flux"),
-                np.column_stack(
-                    [
-                        frac_points[:, 0],
-                        frac_points[:, 1],
-                        cart_points[:, 0],
-                        cart_points[:, 1],
-                        berry_flux.reshape(-1),
-                    ]
+            bc_table = np.column_stack(
+                [
+                    frac_points[:, 0],
+                    frac_points[:, 1],
+                    cart_points[:, 0],
+                    cart_points[:, 1],
+                    berry_flux.reshape(-1),
+                    berry_curvature_density_cart.reshape(-1),
+                    berry_curvature_density_scaled.reshape(-1),
+                ]
+            )
+            bc_path = os.path.join(output_dir, "bc_band_{0}_{1}.txt".format(raw_band_index, fig_suffix))
+            np.savetxt(
+                bc_path,
+                bc_table,
+                header=(
+                    "kappa1_center kappa2_center kx_cart_center ky_cart_center "
+                    "berry_flux berry_curvature_density_cart berry_curvature_density_scaled"
                 ),
-                "kappa1_center kappa2_center kx_cart_center ky_cart_center berry_flux",
-            )
-
-            berry_density_path = os.path.join(
-                output_dir,
-                "berry_curvature_density_band_{0}_{1}.pdf".format(raw_band_index, fig_suffix),
+                fmt="%15.8f",
             )
             plot_scalar_field(
                 plaquette_plot_mesh,
-                berry_curvature_density_cart,
-                berry_density_path,
+                berry_curvature_density_scaled,
+                os.path.join(
+                    output_dir,
+                    "berry_curvature_density_band_{0}_{1}_scaled.pdf".format(raw_band_index, fig_suffix),
+                ),
                 berry_curvature_density_plot_title(
-                    "Berry Curvature Density for Band {0} in {1}".format(raw_band_index, valley_str),
+                    "BC for Band {0} in {1}".format(raw_band_index, valley_str),
                     berry_curvature_density_cart,
                     b_phys_2d,
                     delta_kappa1,
                     delta_kappa2,
                 ),
-                field_colorbar_label("berry_curvature_density_cart"),
-                np.column_stack(
-                    [
-                        frac_points[:, 0],
-                        frac_points[:, 1],
-                        cart_points[:, 0],
-                        cart_points[:, 1],
-                        berry_curvature_density_cart.reshape(-1),
-                    ]
-                ),
-                "kappa1_center kappa2_center kx_cart_center ky_cart_center berry_curvature_density_cart",
+                field_colorbar_label("berry_curvature_density_scaled"),
+                save_table=False,
             )
 
             qgt_fields = transform_qgt_to_cartesian(
@@ -842,7 +837,7 @@ def main():
                 interior_cart_mesh,
                 interior_plot_mesh,
                 qgt_fields,
-                "QGT for Band {0} in {1}".format(raw_band_index, valley_str),
+                "Tr g for Band {0} in {1}".format(raw_band_index, valley_str),
                 b_phys_2d,
                 delta_kappa1,
                 delta_kappa2,
@@ -860,11 +855,14 @@ def main():
                     )
                 )
             print(
-                "[INFO] Band {0}: Chern number = {1:.8f}, Berry flux -> {2}, Berry density -> {3}".format(
+                "[INFO] Band {0}: Chern number = {1:.8f}, BC table -> {2}, scaled Berry density -> {3}".format(
                     raw_band_index,
                     chern_number,
-                    berry_flux_path,
-                    berry_density_path,
+                    bc_path,
+                    os.path.join(
+                        output_dir,
+                        "berry_curvature_density_band_{0}_{1}_scaled.pdf".format(raw_band_index, fig_suffix),
+                    ),
                 )
             )
 
@@ -877,18 +875,18 @@ def main():
                 delta_kappa1,
                 delta_kappa2,
             )
+            berry_curvature_density_scaled_multiband = scale_cartesian_geometric_field(
+                berry_curvature_density_multiband,
+                b_phys_2d,
+            )
             chern_number = np.sum(berry_flux_multiband) / (2.0 * np.pi)
 
             frac_points = flatten_coordinate_mesh(plaquette_fractional_mesh)
             cart_points = flatten_coordinate_mesh(plaquette_cart_mesh)
 
-            multiband_flux_path = os.path.join(output_dir, "berry_flux_bands_{0}_{1}.pdf".format(band_str, fig_suffix))
-            plot_scalar_field(
-                plaquette_plot_mesh,
-                berry_flux_multiband,
-                multiband_flux_path,
-                "Berry Flux for Bands {0} in {1} C={2:.4f}".format(band_str, valley_str, chern_number),
-                field_colorbar_label("berry_flux"),
+            bc_multiband_path = os.path.join(output_dir, "bc_bands_{0}_{1}.txt".format(band_str, fig_suffix))
+            np.savetxt(
+                bc_multiband_path,
                 np.column_stack(
                     [
                         frac_points[:, 0],
@@ -896,37 +894,32 @@ def main():
                         cart_points[:, 0],
                         cart_points[:, 1],
                         berry_flux_multiband.reshape(-1),
+                        berry_curvature_density_multiband.reshape(-1),
+                        berry_curvature_density_scaled_multiband.reshape(-1),
                     ]
                 ),
-                "kappa1_center kappa2_center kx_cart_center ky_cart_center berry_flux",
-            )
-
-            multiband_density_path = os.path.join(
-                output_dir,
-                "berry_curvature_density_bands_{0}_{1}.pdf".format(band_str, fig_suffix),
+                header=(
+                    "kappa1_center kappa2_center kx_cart_center ky_cart_center "
+                    "berry_flux berry_curvature_density_cart berry_curvature_density_scaled"
+                ),
+                fmt="%15.8f",
             )
             plot_scalar_field(
                 plaquette_plot_mesh,
-                berry_curvature_density_multiband,
-                multiband_density_path,
+                berry_curvature_density_scaled_multiband,
+                os.path.join(
+                    output_dir,
+                    "berry_curvature_density_bands_{0}_{1}_scaled.pdf".format(band_str, fig_suffix),
+                ),
                 berry_curvature_density_plot_title(
-                    "Berry Curvature Density for Bands {0} in {1}".format(band_str, valley_str),
+                    "BC for Bands {0} in {1}".format(band_str, valley_str),
                     berry_curvature_density_multiband,
                     b_phys_2d,
                     delta_kappa1,
                     delta_kappa2,
                 ),
-                field_colorbar_label("berry_curvature_density_cart"),
-                np.column_stack(
-                    [
-                        frac_points[:, 0],
-                        frac_points[:, 1],
-                        cart_points[:, 0],
-                        cart_points[:, 1],
-                        berry_curvature_density_multiband.reshape(-1),
-                    ]
-                ),
-                "kappa1_center kappa2_center kx_cart_center ky_cart_center berry_curvature_density_cart",
+                field_colorbar_label("berry_curvature_density_scaled"),
+                save_table=False,
             )
 
             qgt_fields = transform_qgt_to_cartesian(
@@ -946,7 +939,7 @@ def main():
                 interior_cart_mesh,
                 interior_plot_mesh,
                 qgt_fields,
-                "QGT for Bands {0} in {1}".format(band_str, valley_str),
+                "Tr g for Bands {0} in {1}".format(band_str, valley_str),
                 b_phys_2d,
                 delta_kappa1,
                 delta_kappa2,
@@ -964,11 +957,14 @@ def main():
                     )
                 )
             print(
-                "[INFO] Bands {0}: Chern number = {1:.8f}, Berry flux -> {2}, Berry density -> {3}".format(
+                "[INFO] Bands {0}: Chern number = {1:.8f}, BC table -> {2}, scaled Berry density -> {3}".format(
                     band_str,
                     chern_number,
-                    multiband_flux_path,
-                    multiband_density_path,
+                    bc_multiband_path,
+                    os.path.join(
+                        output_dir,
+                        "berry_curvature_density_bands_{0}_{1}_scaled.pdf".format(band_str, fig_suffix),
+                    ),
                 )
             )
 
