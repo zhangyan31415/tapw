@@ -112,6 +112,15 @@ def build_plot_basis(b_phys_2d):
     return b_phys_2d / scale
 
 
+def flatten_output_coordinate_meshes(fractional_mesh, cartesian_mesh, plot_mesh):
+    """Return flattened fractional / physical-cartesian / plot-normalized coordinates."""
+    frac_points = flatten_coordinate_mesh(fractional_mesh)
+    cart_points = flatten_coordinate_mesh(cartesian_mesh)
+    # `plot_points` share the figure-axis normalization: k / |b1|.
+    plot_points = flatten_coordinate_mesh(plot_mesh)
+    return frac_points, cart_points, plot_points
+
+
 def compute_fractional_spacings(num_k1, num_k2):
     """Return `(delta_kappa1, delta_kappa2, axis1, axis2)` for the stored vertex grid."""
     axis1 = build_fractional_axis(num_k1)
@@ -339,6 +348,64 @@ def integrate_cartesian_pseudoscalar_over_bz(pseudoscalar_field_cart, b_phys_2d,
     return float(np.sum(np.asarray(pseudoscalar_field_cart, dtype=float)) * oriented_area_element)
 
 
+def compute_trace_condition_diagnostic(trace_g, omega_xy, eps=1e-14):
+    trace_g = np.asarray(trace_g, dtype=float)
+    omega_xy = np.asarray(omega_xy, dtype=float)
+    if trace_g.shape != omega_xy.shape:
+        raise ValueError(
+            "Cannot compute trace-condition diagnostic: trace_g and omega_xy must have the same shape, "
+            "got {0} and {1}.".format(trace_g.shape, omega_xy.shape)
+        )
+
+    finite_mask = np.isfinite(trace_g) & np.isfinite(omega_xy)
+    valid_trace_g = trace_g[finite_mask]
+    valid_abs_omega = np.abs(omega_xy[finite_mask])
+    if valid_trace_g.size == 0:
+        warning = "No finite trace_g/omega_xy points remain after filtering; delta_tr and delta_g are undefined."
+        return {
+            "mean_trace_g": np.nan,
+            "mean_abs_omega": np.nan,
+            "rms_residual": np.nan,
+            "max_abs_residual": np.nan,
+            "rms_trace_g_fluctuation": np.nan,
+            "num_points": 0,
+            "warning": warning,
+            "delta_tr": np.nan,
+            "delta_g": np.nan,
+        }
+
+    residual = valid_trace_g - valid_abs_omega
+    mean_trace_g = float(np.mean(valid_trace_g))
+    mean_abs_omega = float(np.mean(valid_abs_omega))
+    rms_residual = float(np.sqrt(np.mean(residual**2)))
+    max_abs_residual = float(np.max(np.abs(residual)))
+    rms_trace_g_fluctuation = float(np.sqrt(np.mean((valid_trace_g - mean_trace_g) ** 2)))
+
+    warning_messages = []
+    delta_tr = np.nan
+    delta_g = np.nan
+    if mean_abs_omega <= float(eps):
+        warning_messages.append("mean_abs_omega <= eps; delta_tr is undefined.")
+    else:
+        delta_tr = float(rms_residual / mean_abs_omega)
+    if mean_trace_g <= float(eps):
+        warning_messages.append("mean_trace_g <= eps; delta_g is undefined.")
+    else:
+        delta_g = float(rms_trace_g_fluctuation / mean_trace_g)
+
+    return {
+        "mean_trace_g": mean_trace_g,
+        "mean_abs_omega": mean_abs_omega,
+        "rms_residual": rms_residual,
+        "max_abs_residual": max_abs_residual,
+        "rms_trace_g_fluctuation": rms_trace_g_fluctuation,
+        "num_points": int(valid_trace_g.size),
+        "warning": " ".join(warning_messages),
+        "delta_tr": delta_tr,
+        "delta_g": delta_g,
+    }
+
+
 def trace_g_plot_title(title_prefix, trace_g_cart, b_phys_2d, delta_kappa1, delta_kappa2):
     trace_g_integral = integrate_cartesian_field_over_bz(trace_g_cart, b_phys_2d, delta_kappa1, delta_kappa2)
     return (
@@ -367,6 +434,117 @@ def _save_table(output_path, data, header):
     txt_path = output_path.replace(".pdf", ".txt")
     np.savetxt(txt_path, data, header=header, fmt="%15.8f")
     print("Saved data to {0}".format(txt_path))
+
+
+def _format_trace_condition_value(value):
+    return "{0:.8f}".format(float(value))
+
+
+def _format_band_indices(band_indices):
+    return ",".join(str(index) for index in band_indices)
+
+
+def _finite_cartesian_integral_or_nan(field_cart, integrator, b_phys_2d, delta_kappa1, delta_kappa2):
+    field_cart = np.asarray(field_cart, dtype=float)
+    if not np.all(np.isfinite(field_cart)):
+        return np.nan
+    return integrator(field_cart, b_phys_2d, delta_kappa1, delta_kappa2)
+
+
+def _finite_scaled_integral_or_nan(field_scaled, delta_kappa1, delta_kappa2):
+    field_scaled = np.asarray(field_scaled, dtype=float)
+    if not np.all(np.isfinite(field_scaled)):
+        return np.nan
+    return float(np.sum(field_scaled) * float(delta_kappa1) * float(delta_kappa2))
+
+
+def save_trace_condition_output(
+    output_prefix,
+    band_indices,
+    trace_g_cart,
+    omega_xy_cart,
+    b_phys_2d,
+    delta_kappa1,
+    delta_kappa2,
+    eps=1e-14,
+):
+    trace_g_scaled = scale_cartesian_geometric_field(trace_g_cart, b_phys_2d)
+    omega_xy_scaled = scale_cartesian_geometric_field(omega_xy_cart, b_phys_2d)
+    diagnostic = compute_trace_condition_diagnostic(trace_g_scaled, omega_xy_scaled, eps=eps)
+    band_indices = list(band_indices)
+    mode = "subspace" if len(band_indices) > 1 else "single_band"
+    delta_key = "delta_tr_subspace" if mode == "subspace" else "delta_tr"
+    definition = (
+        "delta_tr_subspace = sqrt(<(Tr g_sub - |Omega_sub|)^2>) / <|Omega_sub|>"
+        if mode == "subspace"
+        else "delta_tr = sqrt(<(Tr g - |Omega|)^2>) / <|Omega|>"
+    )
+    subspace_warning = (
+        "This is a subspace trace-condition diagnostic, not a single-band ideal-Chern-band diagnostic."
+    )
+    integral_trace_g = _finite_scaled_integral_or_nan(
+        trace_g_scaled,
+        delta_kappa1,
+        delta_kappa2,
+    )
+    integral_abs_omega = _finite_scaled_integral_or_nan(
+        np.abs(omega_xy_scaled),
+        delta_kappa1,
+        delta_kappa2,
+    )
+    chern_from_qgt_omega = _finite_scaled_integral_or_nan(
+        omega_xy_scaled,
+        delta_kappa1,
+        delta_kappa2,
+    )
+    if np.isfinite(chern_from_qgt_omega):
+        chern_from_qgt_omega *= np.sign(float(np.linalg.det(b_phys_2d))) or 1.0
+
+    warning_text = diagnostic["warning"]
+    if mode == "subspace":
+        warning_text = subspace_warning if not warning_text else subspace_warning + " " + warning_text
+
+    lines = [
+        "# Quantum-geometry trace-condition diagnostic",
+        "# Tr g(k) = g_xx(k) + g_yy(k)",
+        "# <Tr g> = <Tr g(k)>_BZ",
+        "# absOmega(k) = |Omega_xy(k)|",
+        "# rms_trace_condition_residual = sqrt(<(Tr g - |Omega|)^2>)",
+        "# rms_trace_g_fluctuation = sqrt(<(Tr g - <Tr g>)^2>)",
+        "# " + definition,
+        "# delta_g = sqrt(<(Tr g - <Tr g>)^2>) / <Tr g>",
+        "# mode: {0}".format(mode),
+    ]
+    if mode == "subspace":
+        lines.append("# WARNING: {0}".format(subspace_warning))
+    lines.extend(
+        [
+            "mode {0}".format(mode),
+            "band_indices {0}".format(_format_band_indices(band_indices)),
+            "",
+            "{0} {1}".format(delta_key, _format_trace_condition_value(diagnostic["delta_tr"])),
+            "delta_g {0}".format(_format_trace_condition_value(diagnostic["delta_g"])),
+            "mean_trace_g_scaled {0}".format(_format_trace_condition_value(diagnostic["mean_trace_g"])),
+            "mean_abs_omega_scaled {0}".format(_format_trace_condition_value(diagnostic["mean_abs_omega"])),
+            "rms_residual_scaled {0}".format(_format_trace_condition_value(diagnostic["rms_residual"])),
+            "max_abs_residual_scaled {0}".format(_format_trace_condition_value(diagnostic["max_abs_residual"])),
+            "rms_trace_g_fluctuation_scaled {0}".format(
+                _format_trace_condition_value(diagnostic["rms_trace_g_fluctuation"])
+            ),
+            "num_points {0}".format(diagnostic["num_points"]),
+            "integral_trace_g_over_2pi {0}".format(_format_trace_condition_value(integral_trace_g)),
+            "integral_abs_omega_over_2pi {0}".format(_format_trace_condition_value(integral_abs_omega)),
+            "chern_from_qgt_omega {0}".format(_format_trace_condition_value(chern_from_qgt_omega)),
+        ]
+    )
+    if warning_text:
+        lines.append("warning {0}".format(warning_text))
+
+    trace_condition_path = output_prefix + "_trace_condition.txt"
+    with open(trace_condition_path, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print("Saved trace-condition diagnostic to {0}".format(trace_condition_path))
+    return trace_condition_path
 
 
 def field_axis_labels():
@@ -461,11 +639,16 @@ def save_qgt_outputs(
     b_phys_2d,
     delta_kappa1,
     delta_kappa2,
+    band_indices=None,
 ):
     qgt_fields = dict(qgt_fields)
-    # `kx_cart`, `ky_cart` use the physical reciprocal basis and therefore carry 1/Angstrom units.
-    frac_points = flatten_coordinate_mesh(fractional_mesh)
-    cart_points = flatten_coordinate_mesh(cartesian_mesh)
+    # `kx_cart`, `ky_cart` use the physical reciprocal basis (1/Angstrom).
+    # `kx_plot`, `ky_plot` follow the plotted axes and are normalized by |b1|.
+    frac_points, cart_points, plot_points = flatten_output_coordinate_meshes(
+        fractional_mesh,
+        cartesian_mesh,
+        plot_mesh,
+    )
     # `*_cart` fields retain the physical Angstrom^2 normalization. `*_scaled`
     # fields are dimensionless and better suited for cross-twist-angle comparison.
     qgt_fields["trace_g_scaled"] = scale_cartesian_geometric_field(qgt_fields["trace_g_cart"], b_phys_2d)
@@ -477,6 +660,8 @@ def save_qgt_outputs(
             frac_points[:, 1],
             cart_points[:, 0],
             cart_points[:, 1],
+            plot_points[:, 0],
+            plot_points[:, 1],
             qgt_fields["g11_frac"].reshape(-1),
             qgt_fields["g12_frac"].reshape(-1),
             qgt_fields["g22_frac"].reshape(-1),
@@ -495,7 +680,7 @@ def save_qgt_outputs(
         txt_path,
         table,
         header=(
-            "kappa1 kappa2 kx_cart ky_cart "
+            "kappa1 kappa2 kx_cart ky_cart kx_plot ky_plot "
             "g11_frac g12_frac g22_frac omega12_frac "
             "gxx_cart gxy_cart gyy_cart trace_g_cart trace_g_scaled "
             "omega_xy_cart omega_xy_scaled"
@@ -511,6 +696,26 @@ def save_qgt_outputs(
         field_colorbar_label("trace_g_scaled"),
         save_table=False,
     )
+    if band_indices is not None:
+        try:
+            save_trace_condition_output(
+                output_prefix,
+                band_indices,
+                qgt_fields["trace_g_cart"],
+                qgt_fields["omega_xy_cart"],
+                b_phys_2d,
+                delta_kappa1,
+                delta_kappa2,
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            print(
+                "[WARN] Skipping trace-condition diagnostic for {0}: {1}".format(
+                    output_prefix,
+                    exc,
+                )
+            )
 
 
 def parse_lattice_vectors_from_openmx(openmx_path):
@@ -750,6 +955,7 @@ def main():
     # `kappa1`, `kappa2` are dimensionless fractional moire reciprocal coordinates.
     plaquette_fractional_mesh = build_fractional_plaquette_center_mesh(num_k1, num_k2)
     # `kx_cart`, `ky_cart` come from the physical reciprocal basis and are in 1/Angstrom.
+    # `kx_plot`, `ky_plot` use the same k / |b1| normalization as the figure axes.
     plaquette_cart_mesh = fractional_mesh_to_cartesian(plaquette_fractional_mesh, b_phys_2d)
     plaquette_plot_mesh = fractional_mesh_to_cartesian(plaquette_fractional_mesh, b_plot)
     interior_fractional_mesh = build_fractional_interior_mesh(num_k1, num_k2)
@@ -778,8 +984,11 @@ def main():
             )
             chern_number = np.sum(berry_flux) / (2.0 * np.pi)
 
-            frac_points = flatten_coordinate_mesh(plaquette_fractional_mesh)
-            cart_points = flatten_coordinate_mesh(plaquette_cart_mesh)
+            frac_points, cart_points, plot_points = flatten_output_coordinate_meshes(
+                plaquette_fractional_mesh,
+                plaquette_cart_mesh,
+                plaquette_plot_mesh,
+            )
 
             bc_table = np.column_stack(
                 [
@@ -787,6 +996,8 @@ def main():
                     frac_points[:, 1],
                     cart_points[:, 0],
                     cart_points[:, 1],
+                    plot_points[:, 0],
+                    plot_points[:, 1],
                     berry_flux.reshape(-1),
                     berry_curvature_density_cart.reshape(-1),
                     berry_curvature_density_scaled.reshape(-1),
@@ -798,6 +1009,7 @@ def main():
                 bc_table,
                 header=(
                     "kappa1_center kappa2_center kx_cart_center ky_cart_center "
+                    "kx_plot_center ky_plot_center "
                     "berry_flux berry_curvature_density_cart berry_curvature_density_scaled"
                 ),
                 fmt="%15.8f",
@@ -841,6 +1053,7 @@ def main():
                 b_phys_2d,
                 delta_kappa1,
                 delta_kappa2,
+                band_indices=[raw_band_index],
             )
 
             with open(
@@ -881,8 +1094,11 @@ def main():
             )
             chern_number = np.sum(berry_flux_multiband) / (2.0 * np.pi)
 
-            frac_points = flatten_coordinate_mesh(plaquette_fractional_mesh)
-            cart_points = flatten_coordinate_mesh(plaquette_cart_mesh)
+            frac_points, cart_points, plot_points = flatten_output_coordinate_meshes(
+                plaquette_fractional_mesh,
+                plaquette_cart_mesh,
+                plaquette_plot_mesh,
+            )
 
             bc_multiband_path = os.path.join(output_dir, "bc_bands_{0}_{1}.txt".format(band_str, fig_suffix))
             np.savetxt(
@@ -893,6 +1109,8 @@ def main():
                         frac_points[:, 1],
                         cart_points[:, 0],
                         cart_points[:, 1],
+                        plot_points[:, 0],
+                        plot_points[:, 1],
                         berry_flux_multiband.reshape(-1),
                         berry_curvature_density_multiband.reshape(-1),
                         berry_curvature_density_scaled_multiband.reshape(-1),
@@ -900,6 +1118,7 @@ def main():
                 ),
                 header=(
                     "kappa1_center kappa2_center kx_cart_center ky_cart_center "
+                    "kx_plot_center ky_plot_center "
                     "berry_flux berry_curvature_density_cart berry_curvature_density_scaled"
                 ),
                 fmt="%15.8f",
@@ -943,6 +1162,7 @@ def main():
                 b_phys_2d,
                 delta_kappa1,
                 delta_kappa2,
+                band_indices=args.band,
             )
 
             with open(
